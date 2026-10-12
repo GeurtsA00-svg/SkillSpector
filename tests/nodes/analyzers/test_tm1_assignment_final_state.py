@@ -51,3 +51,17 @@ def test_last_true_store_keeps_detection(assignment: str) -> None:
 def test_direct_boolean_controls() -> None:
     assert len(_scan("")) == 1
     assert not _scan("enabled = False\n")
+
+
+@pytest.mark.parametrize(
+    "assignment",
+    [
+        "enabled, enabled, enabled = True, False, enabled\n",
+        "[enabled, enabled, enabled] = [True, False, enabled]\n",
+        "enabled, (enabled, enabled) = True, (False, enabled)\n",
+        "enabled = enabled, enabled = True, enabled\n",
+        "enabled, enabled = True, dynamic\n",
+    ],
+)
+def test_other_final_values_preserve_existing_event_policy(assignment: str) -> None:
+    assert len(_scan(assignment)) == 1

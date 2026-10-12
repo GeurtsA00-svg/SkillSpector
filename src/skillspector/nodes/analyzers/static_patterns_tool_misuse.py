@@ -3667,6 +3667,8 @@ def _build_variable_shell_ast_index(parsed: ParsedPythonFile) -> _VariableShellA
     def record_name_store_values(
         scope: ast.AST, targets: list[ast.AST], value: ast.AST, end: int
     ) -> None:
+        from . import static_python_shell_truthiness
+
         # Pair unpacked targets with their RHS elements so a native alias, a
         # truthy flag, or a self-store is not mistaken for a replacement.
         stores = [
@@ -3677,12 +3679,18 @@ def _build_variable_shell_ast_index(parsed: ParsedPythonFile) -> _VariableShellA
         ]
         # The paired iterator is stack-based. Restore Python's left-to-right
         # target order before deciding which occurrence owns the final value.
-        final_stores = {destination.id: destination for destination, _ in stores}
+        final_values = {destination.id: source for destination, source in stores}
+        false_values = {
+            source
+            for source in set(final_values.values())
+            if static_python_shell_truthiness._truth_value(source, {}) is False
+        }
+        definitely_false = {name for name, source in final_values.items() if source in false_values}
         for destination, source in stores:
             keeps_signal = _store_keeps_shell_signal(destination.id, source, native_aliases)
             if keeps_signal is None:
                 identity_name_stores.add(destination)
-            elif keeps_signal and final_stores[destination.id] is destination:
+            elif keeps_signal and destination.id not in definitely_false:
                 record_binding(scope, destination.id, end, True)
 
     def record_binding(scope: ast.AST, name: str, start: int, restores: bool = False) -> None:
