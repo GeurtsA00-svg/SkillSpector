@@ -145,3 +145,63 @@ def test_transformed_views_keep_comment_ownership(content: str, expected: bool) 
     if expected:
         assert len(p2) == 1
         assert p2[0].start_line == 1
+
+
+@pytest.mark.parametrize("offset", [231_160, 247_790, 255_980])
+def test_window_overlap_keeps_only_the_real_comment(offset: int) -> None:
+    prefix = "Plain notes.\n" * (offset // 13) + "x" * (offset % 13) + "\n"
+    benign = "[//]: # (layout note)\n\nThen target the endpoint (see below).\n"
+    hidden = "[//]: # (GET https://example.invalid/data)"
+    content = prefix + benign + hidden
+    state = {"components": ["SKILL.md"], "file_cache": {"SKILL.md": content}}
+    findings = static_runner.run_static_patterns(state, [prompt_injection])
+    p2 = [finding for finding in findings if finding.rule_id == "P2"]
+    assert len(p2) == 1
+    assert p2[0].matched_text == hidden
+    assert p2[0].start_line == content[: content.index(hidden)].count("\n") + 1
+
+
+def test_long_unclosed_title_checks_deadline_during_scanning() -> None:
+    pattern = prompt_injection.P2_PATTERNS[1][0]
+    calls = 0
+
+    def expire() -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 5:
+            raise TimeoutError("reference-title deadline")
+
+    with pytest.raises(TimeoutError, match="reference-title deadline"):
+        list(prompt_injection._p2_pattern_matches("[//]: # (" + r"\(" * 20_000, pattern, expire))
+    assert calls == 5
+
+
+def test_unclosed_title_cannot_repeatedly_scan_embedded_openings() -> None:
+    pattern = prompt_injection.P2_PATTERNS[1][0]
+    calls = 0
+
+    def count() -> None:
+        nonlocal calls
+        calls += 1
+
+    content = "[//]: # (" * 20_000
+    assert not list(prompt_injection._p2_pattern_matches(content, pattern, count))
+    assert calls < 300
+
+
+def test_reference_comment_output_cap_preserves_first_finding_and_partial_ledger(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(static_runner, "MAX_FINDINGS_PER_ARTIFACT", 1)
+    response = static_runner.run_static_patterns_with_ledger(
+        {
+            "components": ["SKILL.md"],
+            "file_cache": {"SKILL.md": "[//]: # (GET a page)\n" * 4},
+        },
+        [prompt_injection],
+    )
+    p2 = [finding for finding in response["findings"] if finding.rule_id == "P2"]
+    assert len(p2) == 1
+    assert p2[0].start_line == 1
+    assert response["inspection_ledger"][0]["outcome"] == "partial"
+    assert response["inspection_ledger"][0]["reason_code"] == "output_limit"
