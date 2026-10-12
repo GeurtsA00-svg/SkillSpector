@@ -3664,16 +3664,25 @@ def _build_variable_shell_ast_index(parsed: ParsedPythonFile) -> _VariableShellA
             ):
                 attribute_identity_stores.add(destination)
 
-    def record_name_store_values(scope: ast.AST, target: ast.AST, value: ast.AST, end: int) -> None:
+    def record_name_store_values(
+        scope: ast.AST, targets: list[ast.AST], value: ast.AST, end: int
+    ) -> None:
         # Pair unpacked targets with their RHS elements so a native alias, a
         # truthy flag, or a self-store is not mistaken for a replacement.
-        for destination, source in _paired_store_values(target, value):
-            if not isinstance(destination, ast.Name):
-                continue
+        stores = [
+            (destination, source)
+            for target in targets
+            for destination, source in reversed(list(_paired_store_values(target, value)))
+            if isinstance(destination, ast.Name)
+        ]
+        # The paired iterator is stack-based. Restore Python's left-to-right
+        # target order before deciding which occurrence owns the final value.
+        final_stores = {destination.id: destination for destination, _ in stores}
+        for destination, source in stores:
             keeps_signal = _store_keeps_shell_signal(destination.id, source, native_aliases)
             if keeps_signal is None:
                 identity_name_stores.add(destination)
-            elif keeps_signal:
+            elif keeps_signal and final_stores[destination.id] is destination:
                 record_binding(scope, destination.id, end, True)
 
     def record_binding(scope: ast.AST, name: str, start: int, restores: bool = False) -> None:
@@ -3944,8 +3953,7 @@ def _build_variable_shell_ast_index(parsed: ParsedPythonFile) -> _VariableShellA
         if isinstance(node, ast.Assign):
             stack.append((node.value, scope_chain, None))
             stack.extend((target, scope_chain, end) for target in node.targets)
-            for target in node.targets:
-                record_name_store_values(scope, target, node.value, end)
+            record_name_store_values(scope, list(node.targets), node.value, end)
         elif isinstance(node, (ast.AnnAssign, ast.AugAssign)):
             if node.value is not None:
                 stack.append((node.value, scope_chain, None))
@@ -3953,7 +3961,7 @@ def _build_variable_shell_ast_index(parsed: ParsedPythonFile) -> _VariableShellA
             if isinstance(node, ast.AnnAssign):
                 stack.append((node.annotation, scope_chain, None))
                 if node.value is not None:
-                    record_name_store_values(scope, node.target, node.value, end)
+                    record_name_store_values(scope, [node.target], node.value, end)
         elif isinstance(node, ast.NamedExpr):
             stack.append((node.value, scope_chain, None))
             # PEP 572 makes a walrus target inside one or more
@@ -3966,7 +3974,7 @@ def _build_variable_shell_ast_index(parsed: ParsedPythonFile) -> _VariableShellA
             ):
                 target_chain = target_chain[:-1]
             stack.append((node.target, target_chain, end))
-            record_name_store_values(target_chain[-1], node.target, node.value, end)
+            record_name_store_values(target_chain[-1], [node.target], node.value, end)
         elif isinstance(node, (ast.For, ast.AsyncFor)):
             iteration_span = _node_character_span(parsed, node.iter)
             iteration_end = iteration_span[1] if iteration_span is not None else end
