@@ -88,7 +88,8 @@ _ZERO_WIDTH_PATTERN = "[" + "".join(sorted(ZERO_WIDTH_CHARS)) + "]"
 _BIDI_CONTROL_PATTERN = r"[\u202a-\u202e\u2066-\u2069]"
 # Reference-comment titles need a source delimiter scan, rather than a DOTALL
 # keyword expression that can backtrack past an already closed title.
-_REFERENCE_COMMENT_PATTERN = r"\[//\]:\s*#\s*\("
+_REFERENCE_COMMENT_GAP = r"[ \t]*(?:(?:\r\n|\r|\n)[ \t]*)?"
+_REFERENCE_COMMENT_PATTERN = rf"\[//\]:{_REFERENCE_COMMENT_GAP}#{_REFERENCE_COMMENT_GAP}\("
 _REFERENCE_COMMENT_OPENING = re.compile(_REFERENCE_COMMENT_PATTERN)
 _REFERENCE_COMMENT_SPAN = re.compile(r"[\s\S]*")
 # Preserve separator/snake_case, camelCase and acronym-to-PascalCase signals

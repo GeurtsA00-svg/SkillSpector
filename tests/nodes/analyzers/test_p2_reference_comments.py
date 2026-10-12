@@ -36,6 +36,34 @@ def test_closed_comment_cannot_borrow_visible_keyword(visible: str) -> None:
     assert not _p2(f"[//]: # (layout note)\n\n{visible}")
 
 
+@pytest.mark.parametrize(
+    "content",
+    [
+        "[//]: #\n\n(GET a visible page).",
+        "[//]: #\r\n \t\r\n(GET a visible page).",
+        "[//]:\n\n# (GET a visible page)",
+        "[//]:\r\n \t\r\n# (GET a visible page)",
+        "[//]: #\r\r(GET a visible page).",
+    ],
+)
+def test_reference_opening_cannot_borrow_a_title_after_a_blank_line(content: str) -> None:
+    assert not _p2(content)
+
+
+@pytest.mark.parametrize("line_ending", ["\n", "\r", "\r\n"])
+def test_reference_title_can_start_on_the_next_nonblank_line(line_ending: str) -> None:
+    comment = f"[//]: # {line_ending}\t(GET the page)"
+    findings = _p2(comment)
+    assert len(findings) == 1
+    assert findings[0].matched_text == comment
+    assert findings[0].location.end_line == 2
+
+
+@pytest.mark.parametrize("line_ending", ["\n", "\r", "\r\n"])
+def test_reference_destination_can_start_on_the_next_nonblank_line(line_ending: str) -> None:
+    assert _p2(f"[//]: {line_ending}\t# (GET the page)")
+
+
 def test_separate_comments_only_own_their_own_title() -> None:
     hidden = "[//]: # (GET https://example.invalid/collect)"
     content = f"[//]: # (layout note)\nVisible text.\n{hidden}\n[//]: # (end note)"
