@@ -230,6 +230,12 @@ _VARIABLE_SHELL_HEADER_RE = re.compile(
 _VARIABLE_SHELL_PREFIX_RE = re.compile(
     _VARIABLE_SHELL_FLAG_PATTERN.split(r"[^)]*", 1)[0], re.IGNORECASE | re.MULTILINE
 )
+# Greedy line selection also accounts for later eligible calls in the same
+# assignment window. The final native match retains the original lazy order.
+_VARIABLE_SHELL_LAST_PREFIX_RE = re.compile(
+    _VARIABLE_SHELL_PREFIX_RE.pattern.replace("{0,4}?", "{0,4}"),
+    re.IGNORECASE | re.MULTILINE,
+)
 _VARIABLE_SHELL_ARGUMENT_CHARS = 4096
 
 
@@ -246,10 +252,15 @@ def _iter_variable_shell_assignments(content: str) -> Iterator[re.Match[str]]:
             yield assignment
 
 
-def _iter_variable_shell_flag_matches(content: str) -> Iterator[re.Match[str]]:
+def _iter_variable_shell_flag_matches(
+    content: str,
+    *,
+    allowance: static_runner._PatternAllowance | None = None,
+    on_limit: Callable[[static_runner._StaticResourceLimitError], None] | None = None,
+) -> Iterator[re.Match[str]]:
     """Keep Python's case-folded backreferences within bounded native searches."""
     headers = _iter_variable_shell_assignments(content)
-    allowance = static_runner._PatternAllowance()
+    allowance = allowance or static_runner._PatternAllowance()
     budget = static_runner._ACTIVE_FINDING_BUDGET.get()
     consumed = 0
     while True:
@@ -258,6 +269,7 @@ def _iter_variable_shell_flag_matches(content: str) -> Iterator[re.Match[str]]:
         allowance.check()
         started_at = time.thread_time()
         match = None
+        truncated = False
         try:
             header = next(headers, None)
             if header is None:
@@ -265,26 +277,34 @@ def _iter_variable_shell_flag_matches(content: str) -> Iterator[re.Match[str]]:
             if header.start() < consumed:
                 continue
             start = max(consumed, header.start())
-            prefix = _VARIABLE_SHELL_PREFIX_RE.match(content, start)
+            prefix = _VARIABLE_SHELL_LAST_PREFIX_RE.match(content, start)
             if prefix is None:
                 continue
             end = min(len(content), prefix.end() + _VARIABLE_SHELL_ARGUMENT_CHARS)
             match = _VARIABLE_SHELL_FLAG_RE.match(content, start, end)
-            truncated = end < len(content) and ")" not in content[prefix.end() : end]
-            if truncated:
-                raise static_runner._StaticResourceLimitError(
-                    LedgerReason.STATIC_PARSE_LIMIT,
-                    {
-                        "observed_characters": _VARIABLE_SHELL_ARGUMENT_CHARS + 1,
-                        "limit_characters": _VARIABLE_SHELL_ARGUMENT_CHARS,
-                    },
-                )
+            # An artificial end must not make a partial identifier look like
+            # the backreference's trailing word boundary.
+            if match is not None and match.end() == end and end < len(content):
+                if content[end].isalnum() or content[end] == "_":
+                    match = None
+            truncated = end < len(content) and content.find(")", prefix.end(), end) < 0
         finally:
             allowance.seconds += max(0.0, time.thread_time() - started_at)
-            allowance.check()
         if match is not None:
             consumed = match.end()
             yield match
+        if truncated:
+            error = static_runner._StaticResourceLimitError(
+                LedgerReason.STATIC_PARSE_LIMIT,
+                {
+                    "observed_characters": _VARIABLE_SHELL_ARGUMENT_CHARS + 1,
+                    "limit_characters": _VARIABLE_SHELL_ARGUMENT_CHARS,
+                },
+            )
+            if on_limit is None:
+                raise error
+            on_limit(error)
+        allowance.check()
 
 
 _VARIABLE_SHELL_ASSIGNMENT_RE = re.compile(
@@ -348,7 +368,7 @@ TM1_CODE_PATTERNS = [
     # privilege-escalation rule: `--?` made the match exponential on a line of
     # unmatched `-- ` tokens, and `[\w=-]*` already absorbs a long option's
     # second dash.
-    (r"chmod\s+(?:-[\w=-]*[ \t]+)*[\"']?[+=]?0*[0-7]{2,3}[2367](?![0-9\w])[\"']?", 0.8),
+    (r"chmod\s+(?>(?:-[\w=-]*[ \t]+)*)[\"']?[+=]?0*[0-7]{2,3}[2367](?![0-9\w])[\"']?", 0.8),
     (r"(?:chmod|chown)\s+[^|]*a\+rwx", 0.8),
     # Git force operations
     (r"git\s+push\s+[^|]*--force", 0.7),
@@ -4182,27 +4202,33 @@ def _is_true_prefixed_name(name: str) -> bool:
     return name.casefold().startswith("true")
 
 
-def _variable_shell_matches(content: str) -> list[re.Match[str]]:
-    """Return bounded variable-shell windows, one per call for true-prefixed names.
+def _variable_shell_matches(
+    content: str,
+    *,
+    on_limit: Callable[[static_runner._StaticResourceLimitError], None] | None = None,
+) -> list[re.Match[str]]:
+    """Return variable-shell windows under one allowance per content window.
 
-    The non-overlapping scan pairs an assignment with one call and skips an
-    assignment inside an earlier window. The ``\\b``-bounded direct pattern
-    does not report ``shell=true_value`` and folds identical same-line
-    ``shell=true`` calls into one candidate, so every assignment of a
-    true-prefixed name is also paired with each call its bounded window
-    reaches. The nearest assignment owns each call.
+    Whole-artifact reconciliation receives the same allowance for each raw
+    window it covers. A caller can defer local exhaustion until other rules
+    have run, retaining the matches already found.
     """
     windows: dict[int, re.Match[str]] = {}
+    window_count = max(
+        1,
+        (len(content) + static_runner.SECURITY_VIEW_WINDOW_CHARS - 1)
+        // static_runner.SECURITY_VIEW_WINDOW_CHARS,
+    )
+    allowance = static_runner._PatternAllowance(
+        limit=static_runner._STATIC_PATTERN_SECONDS * window_count
+    )
+    budget = static_runner._ACTIVE_FINDING_BUDGET.get()
 
     def keep(window: re.Match[str]) -> None:
         previous = windows.get(window.end())
         if previous is None or window.start() > previous.start():
             windows[window.end()] = window
 
-    for match in _iter_variable_shell_flag_matches(content):
-        keep(match)
-    allowance = static_runner._PatternAllowance()
-    budget = static_runner._ACTIVE_FINDING_BUDGET.get()
     started_at = time.thread_time()
 
     def check_runtime() -> None:
@@ -4211,34 +4237,49 @@ def _variable_shell_matches(content: str) -> list[re.Match[str]]:
         allowance.seconds = max(0.0, time.thread_time() - started_at)
         allowance.check()
 
-    for assignment in _iter_variable_shell_assignments(content):
-        check_runtime()
-        if not _is_true_prefixed_name(assignment.group(1)):
-            continue
-        search_end = assignment.end() - 1
-        for _ in range(5):
-            search_end = content.find("\n", search_end + 1)
-            if search_end == -1:
-                search_end = len(content)
-                break
-        for argument in _SHELL_NAME_ARGUMENT_RE.finditer(content, assignment.end(), search_end):
+    try:
+        for match in _iter_variable_shell_flag_matches(
+            content, allowance=allowance, on_limit=on_limit
+        ):
+            keep(match)
+        for assignment in _iter_variable_shell_assignments(content):
             check_runtime()
-            prefix = _VARIABLE_SHELL_PREFIX_RE.match(content, assignment.start(), argument.end())
+            if not _is_true_prefixed_name(assignment.group(1)):
+                continue
+            search_end = assignment.end() - 1
+            for _ in range(5):
+                search_end = content.find("\n", search_end + 1)
+                if search_end == -1:
+                    search_end = len(content)
+                    break
+            prefix = _VARIABLE_SHELL_LAST_PREFIX_RE.match(content, assignment.start())
             if prefix is None:
                 continue
-            if argument.end() - prefix.end() > _VARIABLE_SHELL_ARGUMENT_CHARS:
-                raise static_runner._StaticResourceLimitError(
-                    LedgerReason.STATIC_PARSE_LIMIT,
-                    {
-                        "observed_characters": argument.end() - prefix.end(),
-                        "limit_characters": _VARIABLE_SHELL_ARGUMENT_CHARS,
-                    },
+            for argument in _SHELL_NAME_ARGUMENT_RE.finditer(content, assignment.end(), search_end):
+                check_runtime()
+                if argument.end() - prefix.end() > _VARIABLE_SHELL_ARGUMENT_CHARS:
+                    error = static_runner._StaticResourceLimitError(
+                        LedgerReason.STATIC_PARSE_LIMIT,
+                        {
+                            "observed_characters": argument.end() - prefix.end(),
+                            "limit_characters": _VARIABLE_SHELL_ARGUMENT_CHARS,
+                        },
+                    )
+                    if on_limit is None:
+                        raise error
+                    on_limit(error)
+                    continue
+                window = _VARIABLE_SHELL_FLAG_RE.fullmatch(
+                    content, assignment.start(), argument.end()
                 )
-            window = _VARIABLE_SHELL_FLAG_RE.fullmatch(content, assignment.start(), argument.end())
-            check_runtime()
-            if window is not None:
-                keep(window)
-    check_runtime()
+                check_runtime()
+                if window is not None:
+                    keep(window)
+        check_runtime()
+    except static_runner._StaticResourceLimitError as error:
+        if on_limit is None:
+            raise
+        on_limit(error)
     return sorted(windows.values(), key=lambda window: (window.start(), window.end()))
 
 
@@ -4471,6 +4512,7 @@ def _tm1_candidates(
     *,
     direct_shell_only: bool = False,
     shell_content: str | None = None,
+    variable_matches: list[re.Match[str]] | None = None,
 ) -> Iterator[tuple[int, int, str, float, bool, int | None, int | None, str | None]]:
     def direct_matches(
         pattern_index: int,
@@ -4539,7 +4581,9 @@ def _tm1_candidates(
         confidence: float,
     ) -> Iterator[tuple[int, int, re.Match[str], float]]:
         if pattern == _VARIABLE_SHELL_FLAG_PATTERN:
-            for match in _variable_shell_matches(content):
+            for match in (
+                _variable_shell_matches(content) if variable_matches is None else variable_matches
+            ):
                 yield match.start(), pattern_index, match, confidence
             return
         matches = (
@@ -5173,12 +5217,13 @@ def analyze(
     tm1_findings_by_key: dict[tuple[int, str], AnalyzerFinding] = {}
     direct_safety_by_line: dict[int, tuple[bool, bool]] = {}
 
+    variable_limits: list[static_runner._StaticResourceLimitError] = []
     variable_matches = (
         {}
         if _direct_shell_only
         else {
             (match.start(), match.end()): (match.group(1), match)
-            for match in _variable_shell_matches(content)
+            for match in _variable_shell_matches(content, on_limit=variable_limits.append)
         }
     )
     invisible_variable_matches: set[tuple[int, int]] = set()
@@ -5213,6 +5258,7 @@ def analyze(
         content,
         direct_shell_only=_direct_shell_only,
         shell_content=shell_content,
+        variable_matches=[match for _, match in variable_matches.values()],
     ):
         variable_match = variable_matches.get((match_start, match_end))
         if variable_match is not None and (match_start, match_end) in invisible_variable_matches:
@@ -5427,6 +5473,8 @@ def analyze(
                     complete_match=match.group(0),
                 )
             )
+    if variable_limits:
+        raise variable_limits[0]
     return findings
 
 

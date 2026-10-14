@@ -403,6 +403,45 @@ def _cached_python_categories(ascii_only: bool, ascii_content: bool) -> dict[str
     return result
 
 
+def _requires_leading_word(source: str) -> bool:
+    """Prove a leading word atom for the small trusted static-pattern grammar."""
+    if not source:
+        return False
+    if source[0].isascii() and (source[0].isalnum() or source[0] == "_"):
+        return len(source) == 1 or source[1] not in "?*{"
+    if not source.startswith("(?:"):
+        return False
+    branches = []
+    branch_start = 3
+    depth = 1
+    cursor = 3
+    in_class = False
+    while cursor < len(source):
+        char = source[cursor]
+        if char == "\\":
+            cursor += 2
+            continue
+        if char == "[":
+            in_class = True
+        elif char == "]":
+            in_class = False
+        elif not in_class:
+            if char == "(":
+                depth += 1
+            elif char == ")":
+                depth -= 1
+                if depth == 0:
+                    branches.append(source[branch_start:cursor])
+                    return (cursor + 1 == len(source) or source[cursor + 1] not in "?*{") and all(
+                        _requires_leading_word(branch) for branch in branches
+                    )
+            elif char == "|" and depth == 1:
+                branches.append(source[branch_start:cursor])
+                branch_start = cursor + 1
+        cursor += 1
+    return False
+
+
 @functools.lru_cache(maxsize=1024)
 def _timed_pattern(source: str, flags: int, ascii_content: bool = False) -> regex.Pattern[str]:
     """Translate the static-rule grammar while retaining original match offsets.
@@ -471,13 +510,7 @@ def _timed_pattern(source: str, flags: int, ascii_content: bool = False) -> rege
                 parts.append(categories[code])
             elif code == "b":
                 following = source[cursor + 2 :]
-                literal_word = re.match(
-                    r"[A-Za-z0-9_]+|\(\?:[A-Za-z0-9_]+(?:\|[A-Za-z0-9_]+)*\)", following
-                )
-                required_word = literal_word is not None and (
-                    literal_word.end() == len(following)
-                    or following[literal_word.end()] not in "?*{"
-                )
+                required_word = _requires_leading_word(following)
                 previous_word = bool(
                     parts
                     and len(parts[-1]) == 1
@@ -540,8 +573,13 @@ def _timed_pattern(source: str, flags: int, ascii_content: bool = False) -> rege
 # have no overlapping unbounded repeats. Keep
 # this registry explicit so a new catalog shape gets reviewed before bypassing
 # the interruptible engine.
+_LINEAR_HIDDEN_DIRECTORY_PATTERN = (
+    rf"(?:create|write|mkdir)(?:[ \t]|\\\r?\n)+(?:[^|&;{LINE_BREAK_CHARS}]|\\\r?\n)*"
+    r"(?:~/|/home/|/tmp/)\.(?!git|ssh|aws)[a-z_-]+"
+)
 _LINEAR_COMMAND_PATTERNS = frozenset(
     {
+        _LINEAR_HIDDEN_DIRECTORY_PATTERN,
         r"curl\s+[^|]*-k\b",
         r"curl\s+[^|]*--insecure\b",
         r"wget\s+[^|]*--no-check-certificate",
@@ -561,12 +599,22 @@ _LINEAR_COMMAND_PATTERNS = frozenset(
 
 
 @functools.lru_cache(maxsize=128)
-def _linear_command_parts(source: str, flags: int) -> tuple[re.Pattern[str], re.Pattern[str], str]:
-    separator = "|" if "[^|]*" in source else "&"
-    prefix, suffix = source.split(f"[^{separator}]*", 1)
+def _linear_command_parts(
+    source: str, flags: int
+) -> tuple[re.Pattern[str], re.Pattern[str], re.Pattern[str]]:
+    if source == _LINEAR_HIDDEN_DIRECTORY_PATTERN:
+        wildcard = rf"(?:[^|&;{LINE_BREAK_CHARS}]|\\\r?\n)*"
+        # Backslash-LF and backslash-CRLF continue a shell logical line. Other
+        # command separators and line breaks end the rule's wildcard span.
+        other_breaks = re.escape(LINE_BREAK_CHARS.replace("\r", "").replace("\n", ""))
+        separator = rf"[|&;{other_breaks}]|(?<!\\)\r|\r(?!\n)|(?<!\\)(?<!\\\r)\n"
+    else:
+        separator = "\\|" if "[^|]*" in source else "&"
+        wildcard = "[^|]*" if "[^|]*" in source else "[^&]*"
+    prefix, suffix = source.split(wildcard, 1)
     # Lookahead retains overlapping suffix starts. The original anchored match
     # below chooses the same greedy span as the complete Python pattern.
-    return re.compile(prefix, flags), re.compile(f"(?={suffix})", flags), separator
+    return re.compile(prefix, flags), re.compile(f"(?={suffix})", flags), re.compile(separator)
 
 
 def _linear_command_matches(
@@ -589,8 +637,8 @@ def _linear_command_matches(
     while start < end:
         if budget is not None:
             budget.check_runtime()
-        delimiter = content.find(separator, start, end)
-        stop = end if delimiter < 0 else delimiter
+        delimiter = separator.search(content, start, end)
+        stop = end if delimiter is None else delimiter.start()
         last_suffix = None
         while candidate is not None and candidate.start() <= stop:
             if candidate.start() >= start:
@@ -3889,7 +3937,9 @@ def run_static_patterns_with_ledger(
                             resource_limit = None
                             resource_metrics = {}
                     except _StaticResourceLimitError as exc:
-                        path_findings = []
+                        path_findings = _cleanup_expired_path_findings(
+                            pattern_modules, path_findings
+                        )
                         resource_limit = exc.reason
                         resource_metrics = exc.metrics
                     except Exception as exc:

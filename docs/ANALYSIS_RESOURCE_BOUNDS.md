@@ -336,6 +336,10 @@ infinite, or NaN values log a warning and retain the 300-second default.
 
 The shared matcher has a fixed 0.25-second matching CPU limit per rule and content window.
 Paragraph-matched rules share this allowance across all their paragraphs.
+Ranges of eight characters or fewer use batched native searches. Longer ranges
+retain the interruptible engine; timer setup can make paragraph-dense windows
+roughly two to three times slower than untimed matching. This keeps their
+backtracking bounded rather than extending the native exception to larger inputs.
 Raising the artifact allowance does not raise this limit. It covers routed rules
 in prompt injection, tool misuse, data exfiltration, supply chain, agent snooping,
 excessive agency, memory poisoning, and rogue agents. Through paragraph matching,
@@ -351,9 +355,14 @@ unbounded command spans and the original greedy matches. Memory poisoning's
 2–20-character repetition rule uses Python's native engine: failed candidates
 examine at most 20 copies, and successful candidates consume the repeated run.
 The variable shell-flag rule also retains Python’s native backreference semantics.
-It checks assignment headers separately and bounds each candidate call-argument
-tail to 4,096 characters, with the same accumulated matching CPU allowance. A
-potential match extending beyond that span reports `static_parse_limit`.
+It checks assignment headers separately, considers every eligible call in the
+four-line assignment gap, and stops its native search 4,096 characters after
+the last eligible call head. This is a conservative bound: an unterminated tail
+reports `static_parse_limit` even if no later `shell=` exists. In-window matches
+are retained. Both variable-name passes share one accumulated matching allowance,
+and each analyzer window computes them once. Whole-artifact reconciliation gets
+0.25 seconds per 256,000 characters. A variable-shell limit is reported after the
+other lexical tool-misuse rules run, so it cannot hide their findings.
 The repetition rule is bounded by the 256,000-character inspection window and the
 artifact deadline, rather than the slower engine's per-search timer.
 

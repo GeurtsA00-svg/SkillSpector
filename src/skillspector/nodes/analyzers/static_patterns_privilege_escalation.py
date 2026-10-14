@@ -107,7 +107,7 @@ PE2_CODE_PATTERNS = [
     # unmatched `-- ` tokens that made the match exponential.  `[\w=-]*` already
     # absorbs the second dash of a long option, so `-` alone covers both.
     (
-        r"chmod\s+(?:-[\w=-]*[ \t]+)*[\"']?[+=]?0*[2-7][0-7]{3}[\"']?(?![0-9\w])",
+        r"chmod\s+(?>(?:-[\w=-]*[ \t]+)*)[\"']?[+=]?0*[2-7][0-7]{3}[\"']?(?![0-9\w])",
         0.8,
     ),
 ]
