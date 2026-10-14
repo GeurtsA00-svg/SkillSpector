@@ -285,7 +285,7 @@ class TestEA1NestedObjectArgumentNotFlagged:
     [
         "[\"grep --include='*'\"]",
         "['grep --include=\"*\"']",
-        "[\"search\", \"grep --include='*'\"]",
+        '["search", "grep --include=\'*\'"]',
         r'["grep --include=\"*\""]',
         "['grep --include=''*''']",
         '["*" + "suffix"]',
@@ -313,7 +313,7 @@ def test_only_complete_top_level_wildcard_elements_are_flagged(value: str) -> No
         '[search, "*"]',
         '["search {x}", "*"]',
         '["search [x]", "*"]',
-        "[\"grep --include='*'\", \"*\"]",
+        '["grep --include=\'*\'", "*"]',
         r'["grep --include=\"*\"", "*"]',
         "['grep --include=''*''', '*']",
         '["search", "*", "grep"]',
