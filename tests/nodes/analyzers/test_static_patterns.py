@@ -3099,6 +3099,7 @@ def test_numeric_chmod_atomic_options_preserve_spans(analyzer):
 @pytest.mark.parametrize("sample", ["prose", "json"])
 def test_hidden_directory_near_miss_keeps_later_rogue_findings(sample):
     import json
+
     from skillspector.nodes.analyzers import static_patterns_rogue_agent as module
 
     if sample == "prose":
