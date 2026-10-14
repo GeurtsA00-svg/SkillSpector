@@ -577,6 +577,63 @@ def test_build_context_path_is_file_not_dir(tmp_path: Path) -> None:
         build_context(state)
 
 
+_PEP263_LATIN1_SOURCE = b"# coding: latin-1\n# caf\xe9\nvalue = 1\n"
+
+
+@pytest.mark.parametrize(
+    ("filename", "source"),
+    [
+        pytest.param("runner.py", _PEP263_LATIN1_SOURCE, id="python-suffix"),
+        pytest.param("runner.pyw", _PEP263_LATIN1_SOURCE, id="python-window"),
+        pytest.param(
+            "runner",
+            b"#!/usr/bin/env python3\n" + _PEP263_LATIN1_SOURCE,
+            id="extensionless-shebang",
+        ),
+    ],
+)
+def test_selected_pep263_python_primary_is_decoded_not_rejected(
+    tmp_path: Path, filename: str, source: bytes
+) -> None:
+    """A supported PEP 263 encoding is the primary's text format, not opaque bytes."""
+    (tmp_path / filename).write_bytes(source)
+
+    result = build_context({"skill_path": str(tmp_path), "primary_file_path": filename})
+
+    artifact = next(item for item in result["artifact_inventory"] if item["path"] == filename)
+    assert artifact["disposition"] == ArtifactDisposition.ANALYZED
+    assert "reason" not in artifact
+    assert "café" in result["local_file_cache"][filename]
+    assert not any(
+        event.get("reason_code") == LedgerReason.UNSUPPORTED_PRIMARY_CONTENT
+        for event in result["inspection_ledger"]
+    )
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        pytest.param(b"# coding: no-such-codec\n# caf\xe9\nvalue = 1\n", id="unknown-codec"),
+        pytest.param(b"# coding: ascii\n# caf\xe9\nvalue = 1\n", id="invalid-for-codec"),
+    ],
+)
+def test_selected_undecodable_python_primary_remains_fatal(tmp_path: Path, source: bytes) -> None:
+    """Only a successful declared decode lifts the generic UTF-8 primary rejection."""
+    (tmp_path / "runner.py").write_bytes(source)
+
+    result = build_context({"skill_path": str(tmp_path), "primary_file_path": "runner.py"})
+
+    artifact = next(item for item in result["artifact_inventory"] if item["path"] == "runner.py")
+    assert artifact["disposition"] == ArtifactDisposition.FAILED
+    assert artifact["reason"] == LedgerReason.UNSUPPORTED_PRIMARY_CONTENT.value
+    assert "runner.py" not in result["local_file_cache"]
+    assert any(
+        event.get("reason_code") == LedgerReason.UNSUPPORTED_PRIMARY_CONTENT
+        and event["outcome"] == LedgerOutcome.FAILED
+        for event in result["inspection_ledger"]
+    )
+
+
 def test_build_context_empty_directory_is_valid_empty_scan(tmp_path: Path) -> None:
     """An existing empty directory is a valid scan target with no components."""
     state: SkillspectorState = {"skill_path": str(tmp_path)}
@@ -644,6 +701,132 @@ def test_source_local_only_preserves_excluded_executable_coverage(
         finding.file == "node_modules/pkg/payload.js"
         for finding in _analyze_concealed_executables(result["component_metadata"])
     )
+
+
+@pytest.mark.parametrize("client_dir", [".agents", ".claude"])
+@pytest.mark.parametrize("use_llm", [True, False])
+def test_conventional_skill_scripts_are_not_concealed(
+    tmp_path: Path, client_dir: str, use_llm: bool
+) -> None:
+    skill_root = tmp_path / client_dir / "skills" / "hello"
+    (skill_root / "scripts").mkdir(parents=True)
+    (skill_root / "SKILL.md").write_text("# Hello\n", encoding="utf-8")
+    (skill_root / "scripts" / "hello.py").write_text('print("hello")\n', encoding="utf-8")
+    hidden_script = skill_root / "scripts" / ".hidden.py"
+    hidden_script.write_text('print("hidden")\n', encoding="utf-8")
+
+    result = build_context({"skill_path": str(tmp_path), "use_llm": use_llm})
+
+    metadata = {item["path"]: item for item in result["component_metadata"]}
+    visible_path = f"{client_dir}/skills/hello/scripts/hello.py"
+    hidden_path = f"{client_dir}/skills/hello/scripts/.hidden.py"
+    assert metadata[visible_path]["concealed_executable"] is False
+    assert metadata[visible_path]["hidden_skill_script_llm_review_withheld"] is True
+    assert metadata[hidden_path]["concealed_executable"] is True
+    findings = _analyze_concealed_executables(result["component_metadata"])
+    assert visible_path not in {finding.file for finding in findings}
+    assert hidden_path in {finding.file for finding in findings}
+    coverage = [
+        event
+        for event in result["inspection_ledger"]
+        if event["path"] == visible_path
+        and event.get("reason_code") == LedgerReason.HIDDEN_SKILL_EXECUTABLE_LOCAL_ONLY
+    ]
+    if use_llm:
+        assert len(coverage) == 1
+        assert coverage[0]["outcome"] == LedgerOutcome.SKIPPED
+        assert "not sent to an external LLM" in coverage[0]["message"]
+    else:
+        assert coverage == []
+
+
+def test_conventional_skill_script_with_compatible_env_shebang_is_not_concealed(
+    tmp_path: Path,
+) -> None:
+    skill_root = tmp_path / ".claude" / "skills" / "demo"
+    script = skill_root / "scripts" / "run.py"
+    script.parent.mkdir(parents=True)
+    (skill_root / "SKILL.md").write_text("# Demo\n", encoding="utf-8")
+    script.write_bytes(b"#!/usr/bin/env python3\nprint(1)\n")
+
+    result = build_context({"skill_path": str(tmp_path), "use_llm": False})
+
+    metadata = next(
+        item
+        for item in result["component_metadata"]
+        if item["path"] == ".claude/skills/demo/scripts/run.py"
+    )
+    assert metadata["concealed_executable"] is False
+
+
+@pytest.mark.parametrize(
+    ("relative_path", "payload", "manifest", "source_local_only"),
+    [
+        (".claude/skills/demo/scripts/run.py", b"#!/usr/bin/env python3\nprint(1)\n", False, False),
+        (
+            ".claude/skills/demo/scripts/run.py",
+            b"#!/usr/bin/env python3\nprint(1)\n",
+            "symlink",
+            False,
+        ),
+        (".claude/skills/demo/scripts/tool.py", b"\x7fELF" + b"\0" * 20, True, False),
+        (".claude/skills/demo/scripts/tool.py", b"MZ" + b"\0" * 20, True, False),
+        (".claude/skills/demo/scripts/run", b"#!/bin/sh\ntrue\n", True, False),
+        (".claude/skills/demo/scripts/run.bat", b"@echo off\r\n", True, False),
+        (
+            ".claude/skills/demo/scripts/run.py",
+            b"#!/usr/bin/env -Sbash\ntrue\n",
+            True,
+            False,
+        ),
+        (
+            ".claude/skills/demo/scripts/run.py",
+            b"#!/usr/bin/env --split-string=bash\ntrue\n",
+            True,
+            False,
+        ),
+        (".claude/skills/.demo/scripts/run.py", b"#!/usr/bin/env python3\nprint(1)\n", True, False),
+        (
+            ".claude/skills/demo/scripts/.cache/run.py",
+            b"#!/usr/bin/env python3\nprint(1)\n",
+            True,
+            False,
+        ),
+        (".github/skills/demo/scripts/run.py", b"#!/usr/bin/env python3\nprint(1)\n", True, False),
+        (
+            "project/.claude/skills/demo/scripts/run.py",
+            b"#!/usr/bin/env python3\nprint(1)\n",
+            True,
+            False,
+        ),
+        (".claude/skills/demo/scripts/run.py", b"#!/usr/bin/env python3\nprint(1)\n", True, True),
+        (".claude/skills/demo/scripts/run.py", b"#!/bin/bash\nprint(1)\n", True, False),
+    ],
+)
+def test_skill_script_exemption_fails_closed(
+    tmp_path: Path,
+    relative_path: str,
+    payload: bytes,
+    manifest: bool | str,
+    source_local_only: bool,
+) -> None:
+    target = tmp_path / relative_path
+    target.parent.mkdir(parents=True)
+    target.write_bytes(payload)
+    skill_root = target.parents[1]
+    skill_root.mkdir(parents=True, exist_ok=True)
+    if manifest is True:
+        (skill_root / "SKILL.md").write_text("# Demo\n", encoding="utf-8")
+    elif manifest == "symlink":
+        external = tmp_path / "outside.md"
+        external.write_text("# Demo\n", encoding="utf-8")
+        (skill_root / "SKILL.md").symlink_to(external)
+
+    result = build_context({"skill_path": str(tmp_path), "source_local_only": source_local_only})
+    metadata = next(item for item in result["component_metadata"] if item["path"] == relative_path)
+    assert metadata["concealed_executable"] is True
+    findings = _analyze_concealed_executables(result["component_metadata"])
+    assert relative_path in {finding.file for finding in findings}
 
 
 def test_build_context_model_config_uses_bound_provider(tmp_path: Path) -> None:
@@ -837,6 +1020,55 @@ def test_build_context_skill_md_lowercase(tmp_path: Path) -> None:
     assert "references/guide.md" in result["components"]
 
 
+def test_build_context_parses_manifest_with_utf8_bom(tmp_path: Path) -> None:
+    """A leading UTF-8 BOM before the frontmatter delimiter must not blank the manifest.
+
+    Regression guard: ``decode_text()`` decodes with plain "utf-8", which does not
+    strip a leading byte-order mark (only "utf-8-sig" does), so
+    ``content[0] == "\\ufeff"`` and the naive ``content.startswith("---")`` check in
+    ``_parse_manifest`` used to fail silently, returning ``{}`` with no ledger record.
+    """
+    (tmp_path / "SKILL.md").write_bytes(
+        b"\xef\xbb\xbf---\nname: bom-skill\ndescription: has a leading BOM\n---\n# Skill\n"
+    )
+    state: SkillspectorState = {"skill_path": str(tmp_path)}
+    result = build_context(state)
+
+    assert result["manifest"]["name"] == "bom-skill"
+    assert result["manifest"]["description"] == "has a leading BOM"
+
+
+def test_build_context_parses_manifest_without_bom_identically(tmp_path: Path) -> None:
+    """Regression guard: the BOM-free sibling of the fixture above parses identically."""
+    (tmp_path / "SKILL.md").write_bytes(
+        b"---\nname: bom-skill\ndescription: has a leading BOM\n---\n# Skill\n"
+    )
+    state: SkillspectorState = {"skill_path": str(tmp_path)}
+    result = build_context(state)
+
+    assert result["manifest"]["name"] == "bom-skill"
+    assert result["manifest"]["description"] == "has a leading BOM"
+
+
+def test_build_context_parses_manifest_with_stacked_utf8_bom(tmp_path: Path) -> None:
+    """A doubled leading BOM must not reproduce the original silent ``{}`` manifest.
+
+    Regression guard: the single-strip fix (``if content.startswith("\\ufeff")``)
+    only removes one BOM, so ``content[0] == "\\ufeff"`` again after the strip and
+    ``content.startswith("---")`` still fails on a stacked BOM. ``_parse_manifest``
+    strips leading BOMs in a loop so repeated markers are all removed.
+    """
+    (tmp_path / "SKILL.md").write_bytes(
+        b"\xef\xbb\xbf\xef\xbb\xbf---\nname: stacked-bom-skill\ndescription: doubled BOM\n"
+        b"---\n# Skill\n"
+    )
+    state: SkillspectorState = {"skill_path": str(tmp_path)}
+    result = build_context(state)
+
+    assert result["manifest"]["name"] == "stacked-bom-skill"
+    assert result["manifest"]["description"] == "doubled BOM"
+
+
 def test_build_context_parses_manifest_from_cached_snapshot_after_file_disappears(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1025,6 +1257,7 @@ def test_build_context_inventories_excluded_executable_descendants(tmp_path: Pat
         "node_modules/pkg/index.js": b"alert(1)\n",
         "node_modules/pkg/module.wasm": b"\x00asm\x01\x00\x00\x00",
         "node_modules/pkg/payload.mjs": b"export default () => 1;\n",
+        "node_modules/pkg/evil.d.mts": b'export{}; console.log("runtime payload after the short executable probe");\n',
         "node_modules/pkg/vector.svg": b"<svg><script>alert(1)</script></svg>\n",
         ".venv/bin/launcher": b"#!/bin/sh\necho launch\n",
         ".tox/env/payload.pyc": b"\x00",
@@ -1040,6 +1273,7 @@ def test_build_context_inventories_excluded_executable_descendants(tmp_path: Pat
         "node_modules/pkg/index.js",
         "node_modules/pkg/module.wasm",
         "node_modules/pkg/payload.mjs",
+        "node_modules/pkg/evil.d.mts",
         "node_modules/pkg/vector.svg",
         ".venv/bin/launcher",
         ".tox/env/payload.pyc",
@@ -1370,7 +1604,7 @@ def test_excluded_artifact_probe_checks_deadline_after_open(
     assert metadata[0]["excluded_inspection_incomplete"] is True
     assert metadata[0]["excluded_from_analysis"] is True
     assert archive_cache == {}
-    assert input_bytes == len("ordi")
+    assert input_bytes == len("ordinary")
     assert len(inventory) == 1
     assert inventory[0]["path"] == "node_modules/README"
     assert inventory[0]["disposition"] == ArtifactDisposition.PARTIAL

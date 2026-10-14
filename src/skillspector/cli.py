@@ -22,6 +22,7 @@ No business logic; workflow lives in the graph.
 from __future__ import annotations
 
 import json
+import math
 import os
 import sys
 import warnings
@@ -33,6 +34,7 @@ from hashlib import sha256
 from pathlib import Path
 from time import monotonic
 from typing import Annotated, cast
+from urllib.parse import quote
 
 import typer
 from langchain_core.runnables import RunnableConfig
@@ -42,9 +44,9 @@ from rich.text import Text
 from rich.tree import Tree
 
 from skillspector import __version__, transitive
-from skillspector.cleanup import cleanup_result
+from skillspector.cleanup import TempDirTracker, cleanup_result
 from skillspector.constants import RISK_THRESHOLD
-from skillspector.graph import graph
+from skillspector.graph_proxy import graph
 from skillspector.input_handler import validate_local_input_path
 from skillspector.inspection_ledger import (
     MAX_INSPECTION_LEDGER_EVENTS,
@@ -55,10 +57,16 @@ from skillspector.inspection_ledger import (
     inspection_work_id,
     ledger_event,
 )
+from skillspector.llm_utils import unsupported_control_error
 from skillspector.logging_config import get_logger, set_level
 from skillspector.mcp_registry import scan_registry
-from skillspector.models import Finding
-from skillspector.multi_skill import MultiSkillDetectionResult, SkillDirectory, detect_skills
+from skillspector.models import OCCURRENCE_FINDING_ID_KEY, Finding
+from skillspector.multi_skill import (
+    MultiSkillDetectionResult,
+    SkillDirectory,
+    _manifest_file,
+    detect_skills,
+)
 from skillspector.nodes.analyzers import ANALYZER_MODULES, ANALYZER_NODE_IDS
 from skillspector.nodes.report import report
 from skillspector.sarif_models import SARIF_SCHEMA_URI, validate_sarif_report
@@ -75,6 +83,7 @@ from skillspector.suppression import (
     dump_baseline,
     effective_findings,
     load_baseline,
+    source_content_key,
 )
 
 logger = get_logger(__name__)
@@ -176,6 +185,8 @@ class _CachedTransitiveResult:
     artifact_inventory: list[dict[str, object]]
     artifact_references: list[dict[str, object]]
     has_executable_scripts: bool
+    execution_successful: bool
+    meta_review_required: bool
     refs: list[str]
 
 
@@ -188,23 +199,30 @@ class _TransitiveTraversalState:
     scanned_bytes: int = 0
     scanned_artifacts: int = 0
     truncation_reasons: list[str] = field(default_factory=list)
+    resource_limit_reached: bool = False
     budget_exhausted: bool = False
     paused_at: float | None = None
 
     def note_truncation(self, reason: str) -> None:
+        self.resource_limit_reached = True
+        self._note_incomplete(reason)
+
+    def exhaust_traversal(self, reason: str) -> None:
+        """Record a limit that prevents additional target execution."""
+        self.budget_exhausted = True
+        self.note_truncation(reason)
+
+    def _note_incomplete(self, reason: str) -> None:
         if len(self.truncation_reasons) >= 256:
             sentinel = "additional transitive limitations omitted"
             if self.truncation_reasons[-1] != sentinel:
                 self.truncation_reasons[-1] = sentinel
-            self.budget_exhausted = True
             return
         if reason not in self.truncation_reasons:
             self.truncation_reasons.append(reason)
-        if "budget" in reason or "time budget" in reason:
-            self.budget_exhausted = True
 
     def note_child_scan_failure(self, target: str) -> None:
-        self.note_truncation(f"transitive child scan failed for {target}")
+        self._note_incomplete(f"transitive child scan failed for {target}")
 
     def _ensure_started(self) -> None:
         if self.started_at is None:
@@ -215,16 +233,16 @@ class _TransitiveTraversalState:
         if self.budget_exhausted:
             return False
         if self.scanned_targets >= self.budget.max_targets:
-            self.note_truncation(f"target budget {self.budget.max_targets} reached")
+            self.exhaust_traversal(f"target budget {self.budget.max_targets} reached")
             return False
         if self.remaining_bytes() <= 0:
-            self.note_truncation(f"byte budget {self.budget.max_bytes} reached")
+            self.exhaust_traversal(f"byte budget {self.budget.max_bytes} reached")
             return False
         if self.remaining_artifacts() <= 0:
-            self.note_truncation(f"artifact budget {self.budget.max_artifacts} reached")
+            self.exhaust_traversal(f"artifact budget {self.budget.max_artifacts} reached")
             return False
         if self.remaining_seconds() <= 0:
-            self.note_truncation(f"time budget {self.budget.max_seconds:.0f}s reached")
+            self.exhaust_traversal(f"time budget {self.budget.max_seconds:.0f}s reached")
             return False
         return True
 
@@ -232,9 +250,9 @@ class _TransitiveTraversalState:
         self._ensure_started()
         self.scanned_targets += 1
         if self.remaining_bytes() <= 0:
-            self.note_truncation(f"byte budget {self.budget.max_bytes} reached")
+            self.exhaust_traversal(f"byte budget {self.budget.max_bytes} reached")
         if self.remaining_seconds() <= 0:
-            self.note_truncation(f"time budget {self.budget.max_seconds:.0f}s reached")
+            self.exhaust_traversal(f"time budget {self.budget.max_seconds:.0f}s reached")
 
     def record_bytes(self, bytes_scanned: int) -> None:
         self._ensure_started()
@@ -256,7 +274,7 @@ class _TransitiveTraversalState:
         self._ensure_started()
         self.scanned_artifacts += max(0, artifacts)
         if self.scanned_artifacts > self.budget.max_artifacts:
-            self.note_truncation(f"artifact budget {self.budget.max_artifacts} reached")
+            self.exhaust_traversal(f"artifact budget {self.budget.max_artifacts} reached")
 
     def pause_deadline(self) -> None:
         if self.started_at is not None and self.paused_at is None:
@@ -306,6 +324,7 @@ def _scan_state(
     baseline: Path | None = None,
     show_suppressed: bool = False,
     source_local_only: bool = False,
+    exclude_patterns: list[str] | None = None,
 ) -> dict[str, object]:
     """Build initial graph state from scan CLI args."""
     state: dict[str, object] = {
@@ -315,6 +334,8 @@ def _scan_state(
         "llm_requested": not no_llm,
         "source_local_only": source_local_only,
     }
+    if exclude_patterns:
+        state["exclude_patterns"] = list(exclude_patterns)
     if yara_rules_dir is not None:
         state["yara_rules_dir"] = yara_rules_dir
     if baseline is not None:
@@ -347,9 +368,44 @@ def _write_result(
             console.print(f"Report saved to: {output}")
     else:
         if format == FormatChoice.terminal:
-            console.print(report_body)
+            console.print(report_body, markup=False)
         else:
             print(report_body)
+
+
+def _exit_on_unsupported_llm_controls(no_llm: bool) -> None:
+    """Exit 2 before any analysis when a configured model rejects a requested control."""
+    if no_llm:
+        return
+    error = unsupported_control_error()
+    if error is not None:
+        err_console.print(f"[red]Error:[/red] {error}")
+        raise typer.Exit(code=2)
+
+
+def _validate_min_coverage(value: float | None) -> float | None:
+    """Accept only finite percentage thresholds in the CLI's supported range."""
+    if value is not None and (not math.isfinite(value) or not 0 <= value <= 100):
+        raise typer.BadParameter("must be a finite number between 0 and 100")
+    return value
+
+
+def _coverage_below_threshold(result: dict[str, object], threshold: float | None) -> bool:
+    """Compare finalized canonical coverage with the requested threshold."""
+    if threshold is None:
+        return False
+    completeness = result.get("analysis_completeness")
+    coverage = completeness.get("coverage_percent") if isinstance(completeness, dict) else None
+    if isinstance(coverage, bool) or not isinstance(coverage, (int, float)):
+        return True
+    if not math.isfinite(coverage):
+        return True
+    return coverage < threshold
+
+
+def _omissions_fail_threshold(omitted_skills: int, threshold: float | None) -> bool:
+    """Known omitted skills leave coverage below any positive threshold."""
+    return bool(omitted_skills) and threshold is not None and threshold > 0
 
 
 def _recursive_json_payload(result: dict[str, object]) -> dict[str, object] | None:
@@ -425,6 +481,14 @@ def scan(
             "--output",
             "-o",
             help="Output file path. If not specified, prints to stdout.",
+        ),
+    ] = None,
+    exclude: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--exclude",
+            help="Exclude a relative POSIX path glob (repeatable). Local single-skill directories "
+            "only; exclusions are reported as uninspected, partial coverage. SKILL.md is required.",
         ),
     ] = None,
     no_llm: Annotated[
@@ -514,6 +578,14 @@ def scan(
             help="Exit 1 when relevant analysis is partial or incomplete.",
         ),
     ] = False,
+    min_coverage: Annotated[
+        float | None,
+        typer.Option(
+            "--min-coverage",
+            help="Exit 1 when canonical analysis coverage is below this percentage (0-100).",
+            callback=_validate_min_coverage,
+        ),
+    ] = None,
     fail_on_findings: Annotated[
         bool,
         typer.Option(
@@ -536,6 +608,13 @@ def scan(
             help="Scan an MCP Registry payload or URL instead of a skill.",
         ),
     ] = False,
+    mcp_registry_compare: Annotated[
+        Path | None,
+        typer.Option(
+            "--mcp-registry-compare",
+            help="Compare registry snapshots with a previous local JSON report; requires --mcp-registry.",
+        ),
+    ] = None,
 ) -> None:
     """
     Scan a skill for security vulnerabilities.
@@ -552,7 +631,7 @@ def scan(
         SKILLSPECTOR_PROVIDER  Active LLM provider: openai | anthropic |
                                anthropic_proxy | bedrock | nv_build |
                                nv_inference | ollama | azure_openai |
-                               openai_compatible | claude_cli | codex_cli |
+                               openai_compatible | gemini | claude_cli |
                                gemini_cli | opencode_cli. Defaults to the NVIDIA path
                                (nv_inference, falling back to nv_build in
                                OSS builds).
@@ -574,16 +653,43 @@ def scan(
           AZURE_OPENAI_ENDPOINT              for azure_openai
         SKILLSPECTOR_COMPAT_API_KEY +
           SKILLSPECTOR_COMPAT_BASE_URL       for openai_compatible
+        GOOGLE_CLOUD_PROJECT [+ GOOGLE_CLOUD_LOCATION]
+                                             for gemini (uses Application
+                                             Default Credentials / Workload Identity)
 
-        ollama uses the local Ollama service. claude_cli, codex_cli,
+        ollama uses the local Ollama service. claude_cli,
         gemini_cli, and opencode_cli use their CLI's existing local
-        authentication session.
+        authentication session. codex_cli is registered but disabled because
+        its read-only sandbox permits host-file reads; use another provider.
     """
+    if mcp_registry_compare is not None and not mcp_registry:
+        err_console.print("[red]Error:[/red] --mcp-registry-compare requires --mcp-registry")
+        raise typer.Exit(code=2)
+    if exclude and (
+        recursive
+        or transitive_enabled
+        or mcp_registry
+        or not Path(input_path).is_dir()
+        or _manifest_file(Path(input_path)) is None
+    ):
+        err_console.print(
+            "[red]Error:[/red] --exclude requires a local single-skill directory with SKILL.md or skill.md "
+            "and cannot be combined with --recursive, --transitive, or --mcp-registry"
+        )
+        raise typer.Exit(code=2)
+
     if mcp_registry:
-        if recursive or baseline is not None or show_suppressed or yara_rules_dir is not None:
+        if (
+            recursive
+            or baseline is not None
+            or show_suppressed
+            or yara_rules_dir is not None
+            or min_coverage is not None
+        ):
             err_console.print(
                 "[red]Error:[/red] --mcp-registry cannot be combined with "
-                "--recursive, --baseline, --show-suppressed, or --yara-rules-dir"
+                "--recursive, --baseline, --show-suppressed, --yara-rules-dir, "
+                "or --min-coverage"
             )
             raise typer.Exit(code=2)
         if format != FormatChoice.json:
@@ -592,7 +698,11 @@ def scan(
             )
             raise typer.Exit(code=2)
         try:
-            result = scan_registry(input_path)
+            result = (
+                scan_registry(input_path, compare_path=mcp_registry_compare)
+                if mcp_registry_compare is not None
+                else scan_registry(input_path)
+            )
             report = json.dumps(result, indent=2)
             if output:
                 output.write_text(report, encoding="utf-8")
@@ -617,7 +727,16 @@ def scan(
     if not input_path.startswith(("http://", "https://", "git@")):
         try:
             resolved_path = validate_local_input_path(resolved_path)
-        except ValueError as e:
+            if (
+                output is not None
+                and resolved_path.is_file()
+                and output.exists()
+                and output.samefile(resolved_path)
+            ):
+                raise ValueError(
+                    "--output points to the input file. Choose a different output path."
+                )
+        except (OSError, ValueError) as e:
             err_console.print(f"[red]Error:[/red] {e}")
             raise typer.Exit(code=2) from e
     try:
@@ -627,10 +746,16 @@ def scan(
     except ValueError as exc:
         err_console.print(f"[red]Error:[/red] invalid transitive prefix: {exc}")
         raise typer.Exit(code=2) from exc
+    _exit_on_unsupported_llm_controls(no_llm)
     yara_dir = str(yara_rules_dir.resolve()) if yara_rules_dir else None
     pre_scan_ledger_events: list[dict[str, object]] = []
+    discovery_console = (
+        err_console if output is None and format is not FormatChoice.terminal else console
+    )
+    recursive_omitted_skills = 0
     if recursive and resolved_path.is_dir():
         detection = detect_skills(resolved_path)
+        recursive_omitted_skills = detection.omitted_symlink_entries
         if not detection.complete:
             pre_scan_ledger_events = _multi_skill_limitation_events(detection)
             err_console.print(
@@ -644,25 +769,41 @@ def scan(
                     "multi-skill scans; scan each sub-skill with its own baseline"
                 )
                 raise typer.Exit(code=2)
-            _scan_multi_skill(
-                detection,
-                format=format,
-                output=output,
-                no_llm=no_llm,
-                baseline=baseline,
-                show_suppressed=show_suppressed,
-                transitive_enabled=transitive_enabled,
-                transitive_depth=transitive_depth,
-                transitive_allow_prefix=transitive_allow_prefix,
-                transitive_deny_prefix=transitive_deny_prefix,
-                yara_dir=yara_dir,
-                verbose=verbose,
-                fail_on_incomplete=fail_on_incomplete,
-                fail_on_findings=fail_on_findings,
-            )
+            # Same error contract as the single-skill scan below: an error that
+            # escapes the combined report (e.g. an unwritable --output) exits 2,
+            # not with a traceback and exit 1, which means "risk found".
+            try:
+                _scan_multi_skill(
+                    detection,
+                    format=format,
+                    output=output,
+                    no_llm=no_llm,
+                    baseline=baseline,
+                    show_suppressed=show_suppressed,
+                    transitive_enabled=transitive_enabled,
+                    transitive_depth=transitive_depth,
+                    transitive_allow_prefix=transitive_allow_prefix,
+                    transitive_deny_prefix=transitive_deny_prefix,
+                    yara_dir=yara_dir,
+                    verbose=verbose,
+                    fail_on_incomplete=fail_on_incomplete,
+                    fail_on_findings=fail_on_findings,
+                    min_coverage=min_coverage,
+                )
+            except typer.Exit:
+                raise
+            except (FileNotFoundError, ValueError) as e:
+                err_console.print(f"[red]Error:[/red] {e}")
+                raise typer.Exit(code=2) from e
+            except Exception as e:
+                if verbose:
+                    err_console.print_exception()
+                else:
+                    err_console.print(f"[red]Error:[/red] {e}")
+                raise typer.Exit(code=2) from e
             return
         if detection.complete and not detection.has_root_skill and len(detection.skills) == 0:
-            (err_console if format in _MACHINE_READABLE_FORMATS else console).print(
+            discovery_console.print(
                 "[yellow]Warning:[/yellow] --recursive specified but no sub-skills "
                 "detected. Scanning as single skill."
             )
@@ -674,8 +815,11 @@ def scan(
                 "[yellow]Warning:[/yellow] Skill discovery was incomplete; continuing "
                 "with a bounded scan and reporting partial coverage."
             )
+        if exclude and detection.is_multi_skill:
+            err_console.print("[red]Error:[/red] --exclude is not supported for multi-skill scans")
+            raise typer.Exit(code=2)
         if detection.is_multi_skill:
-            (err_console if format in _MACHINE_READABLE_FORMATS else console).print(
+            discovery_console.print(
                 f"[yellow]Warning:[/yellow] Found {len(detection.skills)} skills in "
                 f"this directory. Use --recursive to scan each independently."
             )
@@ -707,7 +851,8 @@ def scan(
 
     result = None
     try:
-        result = _scan_skill(
+        scan_skill = partial(_scan_skill, exclude_patterns=exclude) if exclude else _scan_skill
+        result = scan_skill(
             input_path=input_path,
             format=format,
             no_llm=no_llm,
@@ -734,6 +879,10 @@ def scan(
         if fail_on_incomplete and not is_complete:
             raise typer.Exit(code=1)
         if fail_on_findings and effective_findings(result):
+            raise typer.Exit(code=1)
+        if _coverage_below_threshold(result, min_coverage) or _omissions_fail_threshold(
+            recursive_omitted_skills, min_coverage
+        ):
             raise typer.Exit(code=1)
         if (result.get("risk_score") or 0) > RISK_THRESHOLD:
             raise typer.Exit(code=1)
@@ -865,6 +1014,40 @@ def _ledger_work_identity(entry: dict[str, object]) -> str:
     return f"{record_value}:{entry.get('phase', '')}"
 
 
+def _ledger_work_identities(value: object) -> dict[str, str]:
+    """Map each child ledger row's own work ID to the identity it was built from.
+
+    A status ``planned_work`` target carries only the child's work ID, path and
+    range, not the identity behind it. Rows whose identity is not the
+    analyzer's own -- the static_yara rule-set row is ``rule_set:static``, not
+    ``static_yara`` -- must be re-scoped with that same identity in the status
+    path, or the status target and its ledger row get different scoped IDs
+    and the target is dropped as unretained.
+    """
+    identities: dict[str, str] = {}
+    for event in _coerce_dict_list(value):
+        work_id = event.get("work_id")
+        if isinstance(work_id, str) and work_id:
+            identities[work_id] = _ledger_work_identity(event)
+    return identities
+
+
+def _source_scoped_work_id(identity: str, item: dict[str, object]) -> str:
+    """Build the scoped work ID for an already re-pathed ledger row or status target.
+
+    Shared by :func:`_source_aware_ledger` and :func:`_source_aware_status_events`
+    so the two scoping paths cannot derive different IDs for the same work.
+    """
+    start_line = item.get("start_line")
+    end_line = item.get("end_line")
+    return inspection_work_id(
+        identity,
+        str(item.get("path", "SKILL.md")),
+        start_line if isinstance(start_line, int) else None,
+        end_line if isinstance(end_line, int) else None,
+    )
+
+
 def _source_aware_ledger(
     value: object,
     *,
@@ -890,15 +1073,7 @@ def _source_aware_ledger(
                     for item in ids
                     if isinstance(item, str)
                 ]
-        scoped_path = str(entry.get("path", "SKILL.md"))
-        start_line = entry.get("start_line")
-        end_line = entry.get("end_line")
-        entry["work_id"] = inspection_work_id(
-            _ledger_work_identity(entry),
-            scoped_path,
-            start_line if isinstance(start_line, int) else None,
-            end_line if isinstance(end_line, int) else None,
-        )
+        entry["work_id"] = _source_scoped_work_id(_ledger_work_identity(entry), entry)
         events.append(entry)
     return events
 
@@ -911,8 +1086,10 @@ def _source_aware_status_events(
     source_digest: str,
     retained_work_ids: set[str],
     max_planned_work: int,
+    work_identities: dict[str, str] | None = None,
 ) -> list[dict[str, object]]:
     statuses: list[dict[str, object]] = []
+    identities = work_identities or {}
     planned_retained = 0
     for status in _coerce_dict_list(value):
         if len(statuses) >= _TRANSITIVE_MAX_STATUS_EVENTS:
@@ -934,14 +1111,11 @@ def _source_aware_status_events(
                 path = scoped_target.get("path")
                 if isinstance(path, str) and path:
                     scoped_target["path"] = _transitive_component_key(source_identity, path)
-                start_line = scoped_target.get("start_line")
-                end_line = scoped_target.get("end_line")
-                scoped_target["work_id"] = inspection_work_id(
-                    analyzer_id,
-                    str(scoped_target.get("path", "SKILL.md")),
-                    start_line if isinstance(start_line, int) else None,
-                    end_line if isinstance(end_line, int) else None,
-                )
+                # Re-scope with the identity the matching ledger row used, so
+                # both paths agree on the scoped ID; the analyzer ID is only the
+                # fallback for targets with no child ledger row.
+                identity = identities.get(str(target.get("work_id", "")), analyzer_id)
+                scoped_target["work_id"] = _source_scoped_work_id(identity, scoped_target)
                 if scoped_target["work_id"] not in retained_work_ids:
                     continue
                 scoped_work.append(scoped_target)
@@ -1018,7 +1192,7 @@ def _source_aware_file_cache(
     file_cache: dict[str, str], source_identity: str | None
 ) -> dict[str, str]:
     return {
-        _transitive_component_key(source_identity, path): content
+        (source_content_key(source_identity, path) if source_identity else path): content
         for path, content in file_cache.items()
     }
 
@@ -1153,18 +1327,32 @@ def _cache_transitive_result(
     child_filtered = _coerce_findings_list(child_result.get("filtered_findings"))
     child_findings = _coerce_findings_list(child_result.get("findings"))
     all_ids = {finding.finding_id for finding in [*child_filtered, *child_findings]}
+    all_ids.update(
+        occurrence_id
+        for finding in [*child_filtered, *child_findings]
+        for occurrence in finding.occurrences
+        if isinstance((occurrence_id := occurrence.get(OCCURRENCE_FINDING_ID_KEY)), str)
+    )
     all_ids.update(_effective_finding_ids(child_result))
     finding_id_map = {
         finding_id: _scoped_finding_id(source_identity, finding_id) for finding_id in all_ids
     }
 
     def _scope_finding(finding: Finding) -> Finding:
+        occurrences = []
+        for raw in finding.occurrences:
+            occurrence = dict(raw)
+            occurrence_id = occurrence.get(OCCURRENCE_FINDING_ID_KEY)
+            if isinstance(occurrence_id, str):
+                occurrence[OCCURRENCE_FINDING_ID_KEY] = finding_id_map[occurrence_id]
+            occurrences.append(occurrence)
         return replace(
             finding,
             finding_id=finding_id_map[finding.finding_id],
             source_url=target,
             source_identity=source_identity,
             source_digest=source_digest,
+            occurrences=occurrences,
         )
 
     scoped_filtered = [_scope_finding(item) for item in child_filtered[:_TRANSITIVE_MAX_FINDINGS]]
@@ -1189,6 +1377,7 @@ def _cache_transitive_result(
         source_digest=source_digest,
         finding_id_map=finding_id_map,
     )
+    required_failure_events = _distinct_failed_ledger_events(scoped_ledger)
     retained_finding_ids = {item.finding_id for item in scoped_findings}
     for event in scoped_ledger:
         for id_field in ("input_finding_ids", "emitted_finding_ids"):
@@ -1220,6 +1409,14 @@ def _cache_transitive_result(
         limit=traversal.budget.max_ledger_events,
         traversal=traversal,
     )
+    if required_failure_events:
+        scoped_ledger = _ensure_required_failure_events(
+            scoped_ledger,
+            required_failure_events,
+            limit=traversal.budget.max_ledger_events,
+            traversal=traversal,
+            failures_already_observed=True,
+        )
     retained_work_ids = {
         str(event.get("work_id", "")) for event in scoped_ledger if event.get("work_id")
     }
@@ -1230,6 +1427,7 @@ def _cache_transitive_result(
         source_digest=source_digest,
         retained_work_ids=retained_work_ids,
         max_planned_work=len(retained_work_ids),
+        work_identities=_ledger_work_identities(child_result.get("inspection_ledger")),
     )
     child_metadata = _decorate_component_metadata(
         _coerce_component_metadata(child_result.get("component_metadata")),
@@ -1280,6 +1478,8 @@ def _cache_transitive_result(
         ),
         has_executable_scripts=bool(child_result.get("has_executable_scripts", False))
         or any(bool(entry.get("executable", False)) for entry in child_metadata),
+        execution_successful=child_result.get("execution_successful") is not False,
+        meta_review_required=child_result.get("meta_review_required") is True,
         refs=extraction.references,
     )
 
@@ -1361,6 +1561,7 @@ def _run_graph_scan(
     initial_inspection_ledger: list[dict[str, object]] | None = None,
     source_local_only: bool = False,
     stream_progress: bool = False,
+    exclude_patterns: list[str] | None = None,
 ) -> dict[str, object]:
     state = _scan_state(
         input_path=input_path,
@@ -1370,14 +1571,20 @@ def _run_graph_scan(
         baseline=baseline,
         show_suppressed=show_suppressed,
         source_local_only=source_local_only,
+        exclude_patterns=exclude_patterns,
     )
     if transitive_traversal is not None:
         state["transitive_traversal_state"] = transitive_traversal
     if initial_inspection_ledger:
         state["inspection_ledger"] = initial_inspection_ledger
     trace_config = _build_trace_config(input_path, format, no_llm)
+    # A scan that raises or is interrupted returns no result for the caller to
+    # clean up, so remove the temp directory resolve_input made here instead.
+    temp_dir_tracker = TempDirTracker()
+    trace_config["callbacks"] = [temp_dir_tracker]
     if not stream_progress:
-        return cast(dict[str, object], graph.invoke(state, config=trace_config))
+        with temp_dir_tracker.removing_on_error():
+            return cast(dict[str, object], graph.invoke(state, config=trace_config))
 
     analyzer_node_ids = _wired_analyzer_node_ids()
     total_analyzers = len(analyzer_node_ids)
@@ -1395,6 +1602,7 @@ def _run_graph_scan(
             console=err_console,
             transient=True,
         ) as progress,
+        temp_dir_tracker.removing_on_error(),
     ):
         warnings.filterwarnings("ignore", category=UserWarning, module="pydantic")
         task_id = progress.add_task("Resolving input...", total=total_steps)
@@ -1465,11 +1673,14 @@ def _run_graph_scan_for_source(
     initial_inspection_ledger: list[dict[str, object]] | None = None,
     source_local_only: bool = False,
     stream_progress: bool = False,
+    exclude_patterns: list[str] | None = None,
 ) -> dict[str, object]:
     """Invoke a scan without widening the legacy call contract for public sources."""
     run_graph_scan = (
         partial(_run_graph_scan, stream_progress=True) if stream_progress else _run_graph_scan
     )
+    if exclude_patterns:
+        run_graph_scan = partial(run_graph_scan, exclude_patterns=exclude_patterns)
     if initial_inspection_ledger is not None:
         if source_local_only:
             return run_graph_scan(
@@ -1579,7 +1790,8 @@ def _bounded_cache_update(
 ) -> None:
     for path in sorted(values):
         if path in destination:
-            destination[path] = values[path]
+            # Source-scoped keys are disjoint from root paths. A repeated key
+            # refers to the same cached result within this traversal.
             continue
         if len(destination) >= limit:
             traversal.note_truncation(f"{resource} budget {limit} reached")
@@ -1677,6 +1889,124 @@ def _merge_bounded_ledger(
     ]
 
 
+def _is_failed_ledger_event(event: dict[str, object]) -> bool:
+    outcome = event.get("outcome")
+    return getattr(outcome, "value", outcome) == LedgerOutcome.FAILED.value
+
+
+def _distinct_failed_ledger_events(
+    events: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    """Return failed work items once each, preserving their observed order."""
+    failures: list[dict[str, object]] = []
+    work_ids: set[str] = set()
+    for event in events:
+        work_id = str(event.get("work_id", ""))
+        if not _is_failed_ledger_event(event) or work_id in work_ids:
+            continue
+        failures.append(event)
+        work_ids.add(work_id)
+    return failures
+
+
+def _transitive_child_failure_event(source_identity: str) -> dict[str, object]:
+    """Return one deterministic, payload-free fatal fact for an opaque child failure."""
+    return dict(
+        ledger_event(
+            outcome=LedgerOutcome.FAILED,
+            record_type=LedgerRecordType.SYSTEM,
+            phase="transitive_child_scan",
+            path=f"{source_identity}/SKILL.md",
+            reason=LedgerReason.TRANSITIVE_CHILD_SCAN_FAILED,
+        )
+    )
+
+
+def _ensure_required_failure_events(
+    events: list[dict[str, object]],
+    failures: list[dict[str, object]],
+    *,
+    limit: int,
+    traversal: _TransitiveTraversalState,
+    failures_already_observed: bool = False,
+) -> list[dict[str, object]]:
+    """Retain distinct fatal facts before non-fatal rows at the shared bound.
+
+    Pre-observed failures came from the input that produced an existing sentinel;
+    synthesized failures are new observations and remain the required fatal facts.
+    """
+    effective_limit = max(1, limit)
+    incoming_failures = _distinct_failed_ledger_events(failures)
+    required_failures = _distinct_failed_ledger_events([*events, *failures])
+    if not required_failures:
+        return events[:effective_limit]
+    required_work_ids = {str(event.get("work_id", "")) for event in required_failures}
+    event_work_ids = {str(event.get("work_id", "")) for event in events}
+    missing_failures = [
+        event for event in required_failures if str(event.get("work_id", "")) not in event_work_ids
+    ]
+
+    prior_sentinel = next(
+        (event for event in reversed(events) if event.get("phase") == "ledger_output"),
+        None,
+    )
+    would_overflow = len(events) + len(missing_failures) > effective_limit
+    if prior_sentinel is None and not would_overflow:
+        combined = [*events, *missing_failures]
+        if len(combined) < effective_limit:
+            return combined
+        non_failures = [
+            event for event in combined if str(event.get("work_id", "")) not in required_work_ids
+        ]
+        return [*required_failures, *non_failures][:effective_limit]
+
+    traversal.note_truncation(f"inspection ledger budget {effective_limit} reached")
+    if effective_limit == 1:
+        return (incoming_failures or required_failures)[:1]
+    observed_value = prior_sentinel.get("observed_records") if prior_sentinel else None
+    observed_records = observed_value if isinstance(observed_value, int) else len(events)
+    newly_observed = (
+        0 if prior_sentinel is not None and failures_already_observed else len(missing_failures)
+    )
+    sentinel_path = (
+        str(prior_sentinel.get("path", "SKILL.md"))
+        if prior_sentinel is not None and failures_already_observed
+        else str((incoming_failures or required_failures)[0].get("path", "SKILL.md"))
+    )
+    sentinel = dict(
+        ledger_event(
+            outcome=LedgerOutcome.PARTIAL,
+            record_type=LedgerRecordType.SYSTEM,
+            phase="ledger_output",
+            path=sentinel_path,
+            reason=LedgerReason.OUTPUT_LIMIT,
+            observed_records=max(observed_records, len(events)) + newly_observed,
+            limit_records=effective_limit,
+        )
+    )
+    failure_slots = effective_limit - 1
+    if failures_already_observed:
+        retained_failures = required_failures[:failure_slots]
+    else:
+        incoming_work_ids = {str(event.get("work_id", "")) for event in incoming_failures}
+        retained_incoming = incoming_failures[:failure_slots]
+        retained_existing = [
+            event
+            for event in required_failures
+            if str(event.get("work_id", "")) not in incoming_work_ids
+        ][: failure_slots - len(retained_incoming)]
+        retained_failures = [*retained_existing, *retained_incoming]
+    retained_work_ids = {str(event.get("work_id", "")) for event in retained_failures}
+    retained_non_failures = [
+        event
+        for event in events
+        if event.get("phase") != "ledger_output"
+        and str(event.get("work_id", "")) not in retained_work_ids
+        and not _is_failed_ledger_event(event)
+    ][: failure_slots - len(retained_failures)]
+    return [*retained_failures, *retained_non_failures, sentinel]
+
+
 def _scan_transitive(
     initial_result: dict[str, object],
     format: FormatChoice,
@@ -1729,12 +2059,22 @@ def _scan_transitive(
     merged_effective_finding_ids = _effective_finding_ids(initial_result)[
         : traversal.budget.max_findings
     ]
+    root_inspection_ledger = _coerce_dict_list(initial_result.get("inspection_ledger"))
+    required_root_failure_events = _distinct_failed_ledger_events(root_inspection_ledger)
     merged_inspection_ledger = _merge_bounded_ledger(
         [],
-        _coerce_dict_list(initial_result.get("inspection_ledger")),
+        root_inspection_ledger,
         limit=traversal.budget.max_ledger_events,
         traversal=traversal,
     )
+    if required_root_failure_events:
+        merged_inspection_ledger = _ensure_required_failure_events(
+            merged_inspection_ledger,
+            required_root_failure_events,
+            limit=traversal.budget.max_ledger_events,
+            traversal=traversal,
+            failures_already_observed=True,
+        )
     retained_work_ids = {
         str(event.get("work_id", "")) for event in merged_inspection_ledger if event.get("work_id")
     }
@@ -1763,6 +2103,7 @@ def _scan_transitive(
         _coerce_component_metadata(initial_result.get("component_metadata")), None
     )[: traversal.budget.max_components]
     has_executable_scripts = bool(initial_result.get("has_executable_scripts", False))
+    merged_meta_review_required = initial_result.get("meta_review_required") is True
 
     root_extraction = transitive.extract_external_refs_with_metadata(
         local_file_cache,
@@ -1837,6 +2178,7 @@ def _scan_transitive(
                 cache_key = (target, source_local_only)
                 cached = traversal.cache.get(cache_key)
                 if cached is None:
+                    traversal.record_scan()
                     child_result = _run_graph_scan_for_source(
                         input_path=target,
                         format=format,
@@ -1852,15 +2194,17 @@ def _scan_transitive(
                     )
                     cached = _cache_transitive_result(target, child_result, traversal)
                     traversal.cache[cache_key] = cached
-                    traversal.record_scan()
-                    if child_result.get("execution_successful") is False:
-                        traversal.note_child_scan_failure(target)
-                    child_completeness = child_result.get("analysis_completeness")
-                    if (
-                        isinstance(child_completeness, dict)
-                        and child_completeness.get("is_complete") is False
+                if not cached.execution_successful:
+                    traversal.note_child_scan_failure(target)
+                    if not any(
+                        _is_failed_ledger_event(event) for event in cached.inspection_ledger
                     ):
-                        traversal.note_truncation(f"transitive child scan incomplete for {target}")
+                        cached.inspection_ledger = _ensure_required_failure_events(
+                            cached.inspection_ledger,
+                            [_transitive_child_failure_event(cached.source_identity)],
+                            limit=traversal.budget.max_ledger_events,
+                            traversal=traversal,
+                        )
                 transitive_sources.add(target)
                 merged_inspection_ledger = _merge_bounded_ledger(
                     merged_inspection_ledger,
@@ -1868,6 +2212,15 @@ def _scan_transitive(
                     limit=traversal.budget.max_ledger_events,
                     traversal=traversal,
                 )
+                child_failure_events = _distinct_failed_ledger_events(cached.inspection_ledger)
+                if child_failure_events:
+                    merged_inspection_ledger = _ensure_required_failure_events(
+                        merged_inspection_ledger,
+                        child_failure_events,
+                        limit=traversal.budget.max_ledger_events,
+                        traversal=traversal,
+                        failures_already_observed=True,
+                    )
                 global_work_ids = {
                     str(event.get("work_id", ""))
                     for event in merged_inspection_ledger
@@ -1965,6 +2318,8 @@ def _scan_transitive(
                 )
                 if cached.has_executable_scripts:
                     has_executable_scripts = True
+                if cached.meta_review_required:
+                    merged_meta_review_required = True
                 _bounded_extend(
                     merged_components,
                     cached.components,
@@ -2022,7 +2377,17 @@ def _scan_transitive(
             except Exception:
                 transitive_sources.add(target)
                 traversal.note_child_scan_failure(target)
-                if format in _MACHINE_READABLE_FORMATS:
+                merged_inspection_ledger = _ensure_required_failure_events(
+                    merged_inspection_ledger,
+                    [
+                        _transitive_child_failure_event(
+                            _source_identity(target, "transitive-child-scan-failed")
+                        )
+                    ],
+                    limit=traversal.budget.max_ledger_events,
+                    traversal=traversal,
+                )
+                if format in _MACHINE_READABLE_FORMATS or format is FormatChoice.markdown:
                     logger.warning("Transitive scan failed for %s", target)
                 else:
                     console.print(f"[yellow]Warning:[/yellow] Transitive scan failed for {target}")
@@ -2045,7 +2410,8 @@ def _scan_transitive(
             traversal=traversal,
         )
 
-    if traversal.truncation_reasons:
+    if traversal.resource_limit_reached:
+        required_failure_events = _distinct_failed_ledger_events(merged_inspection_ledger)
         traversal_event = ledger_event(
             outcome=LedgerOutcome.PARTIAL,
             record_type=LedgerRecordType.SYSTEM,
@@ -2059,6 +2425,23 @@ def _scan_transitive(
             limit=traversal.budget.max_ledger_events,
             traversal=traversal,
         )
+        if required_failure_events:
+            merged_inspection_ledger = _ensure_required_failure_events(
+                merged_inspection_ledger,
+                required_failure_events,
+                limit=traversal.budget.max_ledger_events,
+                traversal=traversal,
+                failures_already_observed=True,
+            )
+
+    retained_work_ids = {
+        str(event.get("work_id", "")) for event in merged_inspection_ledger if event.get("work_id")
+    }
+    merged_analyzer_status_events = _bounded_root_status_events(
+        merged_analyzer_status_events,
+        retained_work_ids=retained_work_ids,
+        limit=traversal.budget.max_status_events,
+    )
 
     merged_result: dict[str, object] = {
         **initial_result,
@@ -2071,6 +2454,7 @@ def _scan_transitive(
         "artifact_inventory": merged_artifact_inventory,
         "artifact_references": merged_artifact_references,
         "has_executable_scripts": has_executable_scripts,
+        "meta_review_required": merged_meta_review_required,
         "use_llm": initial_result.get("use_llm", not no_llm),
         "llm_requested": initial_result.get("llm_requested", not no_llm),
         "llm_call_log": merged_llm_call_log,
@@ -2095,6 +2479,7 @@ def _scan_transitive(
         result=merged_result,
         discovered_modules=ANALYZER_MODULES,
     )
+    pre_runtime_failure_events = _distinct_failed_ledger_events(merged_inspection_ledger)
     if runtime_event is not None and not has_semantic_runtime_event(
         merged_inspection_ledger, runtime_event
     ):
@@ -2104,6 +2489,14 @@ def _scan_transitive(
             limit=traversal.budget.max_ledger_events,
             traversal=traversal,
         )
+        if pre_runtime_failure_events:
+            merged_inspection_ledger = _ensure_required_failure_events(
+                merged_inspection_ledger,
+                pre_runtime_failure_events,
+                limit=traversal.budget.max_ledger_events,
+                traversal=traversal,
+                failures_already_observed=True,
+            )
         merged_result["inspection_ledger"] = merged_inspection_ledger
     if merged_inspection_ledger or merged_analyzer_status_events:
         completeness, effective_ids = finalize_ledger(merged_result)
@@ -2112,6 +2505,7 @@ def _scan_transitive(
         merged_result["effective_finding_ids"] = effective_ids
     report_result = cast(dict[str, object], report(merged_result))
     report_result["analysis_completeness"] = merged_result.get("analysis_completeness", {})
+    report_result["meta_review_required"] = merged_meta_review_required
     report_result["temp_dir_for_cleanup"] = initial_result.get("temp_dir_for_cleanup")
     active_findings = _coerce_findings_list(report_result.get("filtered_findings"))
     report_result["transitive_finding_count"] = sum(
@@ -2150,13 +2544,13 @@ def _scan_skill(
     transitive_traversal: _TransitiveTraversalState | None = None,
     pre_scan_ledger_events: list[dict[str, object]] | None = None,
     source_local_only: bool = False,
+    exclude_patterns: list[str] | None = None,
 ) -> dict[str, object]:
     yara_dir = str(yara_rules_dir.resolve()) if yara_rules_dir else None
     active_visited: set[str] = set()
     if verbose:
-        (err_console if format in _MACHINE_READABLE_FORMATS else console).print(
-            "[dim]Running scan...[/dim]"
-        )
+        progress_console = console if format is FormatChoice.terminal else err_console
+        progress_console.print("[dim]Running scan...[/dim]")
     logger.debug(
         "Scan started: input_path=%s, format=%s, use_llm=%s, transitive=%s",
         input_path,
@@ -2167,8 +2561,11 @@ def _scan_skill(
     if transitive_enabled and transitive_traversal is None:
         transitive_traversal = _TransitiveTraversalState(cache=transitive_cache or {})
     stream_progress = not verbose and err_console.is_terminal
+    run_for_source = _run_graph_scan_for_source
+    if exclude_patterns:
+        run_for_source = partial(run_for_source, exclude_patterns=exclude_patterns)
     if pre_scan_ledger_events:
-        result = _run_graph_scan_for_source(
+        result = run_for_source(
             input_path=input_path,
             format=format,
             no_llm=no_llm,
@@ -2181,7 +2578,7 @@ def _scan_skill(
             stream_progress=stream_progress,
         )
     else:
-        result = _run_graph_scan_for_source(
+        result = run_for_source(
             input_path=input_path,
             format=format,
             no_llm=no_llm,
@@ -2203,21 +2600,29 @@ def _scan_skill(
         active_visited.add(transitive.canonicalize_source_identity(input_path))
     except ValueError:
         pass
-    return _scan_transitive(
-        initial_result=result,
-        format=format,
-        no_llm=no_llm,
-        max_depth=transitive_depth,
-        transitive_allow_prefix=transitive_allow_prefix,
-        transitive_deny_prefix=transitive_deny_prefix,
-        baseline=baseline,
-        show_suppressed=show_suppressed,
-        visited=active_visited,
-        scan_cache=transitive_cache,
-        yara_dir=yara_dir,
-        traversal=transitive_traversal,
-        source_local_only=source_local_only,
-    )
+    # The root graph has returned, so its tracker no longer guards the root's
+    # temp dir. If the transitive phase is interrupted or raises, nothing is
+    # returned for the caller's cleanup_result, so remove it here. On success
+    # the merged result carries the same temp_dir_for_cleanup for the caller.
+    try:
+        return _scan_transitive(
+            initial_result=result,
+            format=format,
+            no_llm=no_llm,
+            max_depth=transitive_depth,
+            transitive_allow_prefix=transitive_allow_prefix,
+            transitive_deny_prefix=transitive_deny_prefix,
+            baseline=baseline,
+            show_suppressed=show_suppressed,
+            visited=active_visited,
+            scan_cache=transitive_cache,
+            yara_dir=yara_dir,
+            traversal=transitive_traversal,
+            source_local_only=source_local_only,
+        )
+    except BaseException:
+        cleanup_result(result)
+        raise
 
 
 def _multi_skill_public_record_count(result: dict[str, object]) -> int:
@@ -2270,10 +2675,126 @@ def _multi_skill_analysis_completeness(
     }
 
 
+_RECURSIVE_SERIALIZED_OUTPUT_LIMIT_PREFIX = "recursive serialized report character budget "
+_RECURSIVE_CHILD_SCAN_FAILED_MESSAGE = "A recursive child scan failed before complete inspection."
+
+
+def _multi_skill_sarif_notifications(
+    completeness: dict[str, object],
+) -> list[dict[str, object]]:
+    """Project exact aggregate outcomes without inventing an output-limit cause."""
+    notifications: list[dict[str, object]] = []
+    status = str(completeness.get("status", "partial"))
+    raw_limitations = completeness.get("limitations")
+    limitations = (
+        [str(item) for item in raw_limitations if isinstance(item, str)]
+        if isinstance(raw_limitations, list)
+        else []
+    )
+    if status == "failed":
+        notifications.append(
+            {
+                "message": {"text": "One or more recursive skill scans failed."},
+                "level": "error",
+                "properties": {"kind": "inspection_failure"},
+            }
+        )
+    for limitation in limitations:
+        properties: dict[str, object] = {"kind": "inspection_limitation"}
+        if limitation.startswith(_RECURSIVE_SERIALIZED_OUTPUT_LIMIT_PREFIX):
+            properties["reasonCode"] = LedgerReason.OUTPUT_LIMIT.value
+        notifications.append(
+            {
+                "message": {"text": limitation},
+                "level": "warning",
+                "properties": properties,
+            }
+        )
+    if status == "partial" and not limitations:
+        notifications.append(
+            {
+                "message": {
+                    "text": "One or more recursive skill scans were incomplete; "
+                    "see child run notifications."
+                },
+                "level": "warning",
+                "properties": {"kind": "inspection_limitation"},
+            }
+        )
+    return notifications
+
+
+def _multi_skill_text_completeness(completeness: dict[str, object]) -> str:
+    """Render the aggregate state without downgrading a failed child to partial."""
+    status = str(completeness.get("status", "partial"))
+    raw_limitations = completeness.get("limitations")
+    limitations = (
+        [str(item) for item in raw_limitations if isinstance(item, str)]
+        if isinstance(raw_limitations, list)
+        else []
+    )
+    if status == "failed":
+        limitations.insert(0, "One or more recursive skill scans failed.")
+    elif status == "partial" and not limitations:
+        limitations.append("One or more recursive skill scans were incomplete.")
+    details = "\n".join(f"- {item}" for item in limitations)
+    return f"--- Recursive Inspection Completeness ---\n\nStatus: {status}\n\n{details}"
+
+
+def _multi_skill_risk_assessment(
+    max_score: int,
+    *,
+    execution_failed: bool,
+    analysis_incomplete: bool,
+) -> dict[str, object]:
+    """Return bounded aggregate risk evidence independent of child retention."""
+    if max_score >= 81:
+        severity = "CRITICAL"
+    elif max_score >= 51:
+        severity = "HIGH"
+    elif max_score >= 21:
+        severity = "MEDIUM"
+    else:
+        severity = "LOW"
+    recommendation = (
+        "DO_NOT_INSTALL"
+        if execution_failed or max_score > RISK_THRESHOLD
+        else "CAUTION"
+        if analysis_incomplete
+        else "SAFE"
+    )
+    return {
+        "max_risk_score": max_score,
+        "severity": severity,
+        "recommendation": recommendation,
+    }
+
+
+def _multi_skill_text_summary(
+    completeness: dict[str, object],
+    risk_assessment: dict[str, object],
+) -> str:
+    """Render aggregate risk and completeness even when child bodies are omitted."""
+    recommendation = str(risk_assessment.get("recommendation", "CAUTION")).replace("_", " ")
+    risk = (
+        "--- Recursive Risk Assessment ---\n\n"
+        f"Maximum score: {risk_assessment.get('max_risk_score', 0)}/100\n\n"
+        f"Severity: {risk_assessment.get('severity', 'LOW')}\n\n"
+        f"Recommendation: {recommendation}"
+    )
+    return f"{risk}\n\n{_multi_skill_text_completeness(completeness)}"
+
+
+# uriBaseId key used to scope recursive child-run result URIs to their own
+# skill directory (SARIF 2.1.0 section 3.14.14).
+_RECURSIVE_SARIF_URI_BASE_ID = "SKILLROOT"
+
+
 def _multi_skill_sarif_report(
     processed_skills: list[SkillDirectory],
     results: list[dict[str, object]],
     completeness: dict[str, object],
+    risk_assessment: dict[str, object] | None = None,
 ) -> dict[str, object]:
     """Merge bounded child SARIF runs and append one aggregate invocation run."""
     runs: list[dict[str, object]] = []
@@ -2298,25 +2819,59 @@ def _multi_skill_sarif_report(
                 "path": skill.relative_path,
             }
             run["properties"] = run_properties
+            # SARIF 2.1.0 sections 3.4.4 and 3.14.14: scope each child run's
+            # skill-relative URIs to its own skill directory so results from
+            # different skills stop collapsing onto one repo-root-relative
+            # path. Single-skill output is untouched: only recursive merges
+            # set uriBaseId.
+            relative = quote(skill.path.name, safe="")
+            if relative:
+                for result in run.get("results", []):
+                    if not isinstance(result, dict):
+                        continue
+                    for location in result.get("locations", []):
+                        physical = (
+                            location.get("physicalLocation") if isinstance(location, dict) else None
+                        )
+                        artifact = (
+                            physical.get("artifactLocation") if isinstance(physical, dict) else None
+                        )
+                        if isinstance(artifact, dict):
+                            provenance = artifact.get("properties")
+                            if isinstance(provenance, dict) and any(
+                                key in provenance
+                                for key in (
+                                    "sourceIdentity",
+                                    "sourceUrl",
+                                    "sourceDigest",
+                                    "transitiveDepth",
+                                )
+                            ):
+                                continue
+                            artifact["uriBaseId"] = _RECURSIVE_SARIF_URI_BASE_ID
+                run["originalUriBaseIds"] = {
+                    "SCANROOT": {"uri": skill.path.parent.resolve().as_uri() + "/"},
+                    _RECURSIVE_SARIF_URI_BASE_ID: {
+                        "uri": f"{relative}/",
+                        "uriBaseId": "SCANROOT",
+                    },
+                }
             runs.append(run)
 
+    invocation_properties: dict[str, object] = {"analysisCompleteness": completeness}
+    if risk_assessment is not None:
+        invocation_properties["riskAssessment"] = {
+            "maxRiskScore": risk_assessment.get("max_risk_score", 0),
+            "severity": risk_assessment.get("severity", "LOW"),
+            "recommendation": risk_assessment.get("recommendation", "CAUTION"),
+        }
     aggregate_invocation: dict[str, object] = {
         "executionSuccessful": bool(completeness.get("execution_successful", False)),
-        "properties": {"analysisCompleteness": completeness},
+        "properties": invocation_properties,
     }
-    if not bool(completeness.get("is_complete", False)):
-        aggregate_invocation["toolExecutionNotifications"] = [
-            {
-                "message": {
-                    "text": "Recursive analysis was incomplete after an aggregate safety limit."
-                },
-                "level": "warning",
-                "properties": {
-                    "kind": "inspection_limitation",
-                    "reasonCode": "output_limit",
-                },
-            }
-        ]
+    notifications = _multi_skill_sarif_notifications(completeness)
+    if notifications:
+        aggregate_invocation["toolExecutionNotifications"] = notifications
     runs.append(
         {
             "tool": {"driver": {"name": "skillspector", "version": __version__}},
@@ -2373,6 +2928,7 @@ def _scan_multi_skill(
     yara_dir: str | None = None,
     verbose: bool = False,
     fail_on_incomplete: bool = False,
+    min_coverage: float | None = None,
     fail_on_findings: bool = False,
     **legacy_kwargs: object,
 ) -> None:
@@ -2380,10 +2936,10 @@ def _scan_multi_skill(
     if yara_dir is None and isinstance(legacy_kwargs.get("yara_rules_dir"), Path):
         yara_dir = str(legacy_kwargs["yara_rules_dir"])
     skills = detection.skills
-    status_console = (
-        err_console if format in _MACHINE_READABLE_FORMATS and output is None else console
+    progress_console = (
+        err_console if output is None and format is not FormatChoice.terminal else console
     )
-    status_console.print(
+    progress_console.print(
         f"[bold]Multi-skill directory detected:[/bold] {len(skills)} skills found\n"
     )
 
@@ -2405,12 +2961,17 @@ def _scan_multi_skill(
     aggregate_limitations = [
         f"recursive discovery {limitation.resource} limit reached"
         for limitation in detection.limitations[:256]
+        # Symlink omissions get their own clearer aggregate message below;
+        # listing the generic one too would double-report the same entries.
+        if limitation.resource != "multi_skill_symlinked_entry"
+        or not detection.omitted_symlink_entries
     ]
     retained_public_records = 0
     retained_report_characters = 0
     complete_skill_count = 0
     partial_skill_count = 0
     failed_skill_count = 0
+    coverage_failed = False
 
     for i, skill in enumerate(skills, 1):
         if i > _MULTI_SKILL_MAX_SKILLS:
@@ -2435,9 +2996,10 @@ def _scan_multi_skill(
             analysis_incomplete = True
             aggregate_limitations.extend(shared_transitive_traversal.truncation_reasons)
             break
-        status_console.print(
+        progress_console.print(
             f"  [{i}/{len(skills)}] Scanning [bold]{skill.name}[/bold] ({skill.relative_path}/)"
         )
+        result: dict[str, object] | None = None
         try:
             result = _scan_skill(
                 input_path=str(skill.path),
@@ -2455,97 +3017,141 @@ def _scan_multi_skill(
                 transitive_traversal=shared_transitive_traversal,
                 source_local_only=skill.local_only,
             )
-            result_body = _result_body(result)
-            result_characters = len(result_body)
-            result_records = _multi_skill_public_record_count(result)
-            has_findings = has_findings or bool(effective_findings(result))
-            if (
-                retained_public_records + result_records > _MULTI_SKILL_MAX_PUBLIC_RECORDS
-                or retained_report_characters + result_characters
-                > _MULTI_SKILL_MAX_REPORT_CHARACTERS
-            ):
-                analysis_incomplete = True
-                if retained_public_records + result_records > _MULTI_SKILL_MAX_PUBLIC_RECORDS:
-                    aggregate_limitations.append(
-                        "recursive public finding record budget "
-                        f"{_MULTI_SKILL_MAX_PUBLIC_RECORDS} reached"
-                    )
-                if (
-                    retained_report_characters + result_characters
-                    > _MULTI_SKILL_MAX_REPORT_CHARACTERS
-                ):
-                    aggregate_limitations.append(
-                        "recursive report character budget "
-                        f"{_MULTI_SKILL_MAX_REPORT_CHARACTERS} reached"
-                    )
-                cleanup_result(result)
-                break
-            results.append(result)
-            processed_skills.append(skill)
-            retained_public_records += result_records
-            retained_report_characters += result_characters
             child_failed = result.get("execution_successful") is False
-            if child_failed:
-                execution_failed = True
-                failed_skill_count += 1
+            if not child_failed and _coverage_below_threshold(result, min_coverage):
+                coverage_failed = True
             completeness_value = result.get("analysis_completeness")
-            if (
+            child_partial = (
                 not child_failed
                 and isinstance(completeness_value, dict)
                 and not bool(completeness_value.get("is_complete", True))
-            ):
-                analysis_incomplete = True
-                partial_skill_count += 1
-            elif not child_failed:
-                complete_skill_count += 1
+            )
             score = result.get("risk_score") or 0
             try:
                 score = int(score)
             except (TypeError, ValueError):
                 score = 0
-            if score > max_score:
-                max_score = score
             child_transitive_count = result.get("transitive_finding_count")
-            if isinstance(child_transitive_count, int):
-                transitive_finding_count += child_transitive_count
-            for source in _coerce_str_path_list(result.get("transitive_sources")):
-                transitive_sources.add(source)
+            child_transitive_increment = (
+                child_transitive_count if isinstance(child_transitive_count, int) else 0
+            )
+            child_transitive_sources = _coerce_str_path_list(result.get("transitive_sources"))
             severity = result.get("risk_severity") or "LOW"
-            status_console.print(f"         Score: {score}/100 ({severity})\n")
-        except Exception as e:
-            error_message = str(e)[:1_024]
+            progress_console.print(f"         Score: {score}/100 ({severity})\n")
+
+            result_body = _result_body(result)
+            result_characters = len(result_body)
+            result_records = _multi_skill_public_record_count(result)
+            child_has_findings = bool(effective_findings(result))
+            exceeds_record_limit = (
+                retained_public_records + result_records > _MULTI_SKILL_MAX_PUBLIC_RECORDS
+            )
+            exceeds_character_limit = (
+                retained_report_characters + result_characters > _MULTI_SKILL_MAX_REPORT_CHARACTERS
+            )
+            if exceeds_record_limit or exceeds_character_limit:
+                cleanup_result(result)
+
+            if child_failed:
+                execution_failed = True
+                failed_skill_count += 1
+            elif child_partial:
+                analysis_incomplete = True
+                partial_skill_count += 1
+            else:
+                complete_skill_count += 1
+            max_score = max(max_score, score)
+            transitive_finding_count += child_transitive_increment
+            transitive_sources.update(child_transitive_sources)
+            has_findings = has_findings or child_has_findings
+
+            if exceeds_record_limit or exceeds_character_limit:
+                analysis_incomplete = True
+                if exceeds_record_limit:
+                    aggregate_limitations.append(
+                        "recursive public finding record budget "
+                        f"{_MULTI_SKILL_MAX_PUBLIC_RECORDS} reached"
+                    )
+                if exceeds_character_limit:
+                    aggregate_limitations.append(
+                        "recursive report character budget "
+                        f"{_MULTI_SKILL_MAX_REPORT_CHARACTERS} reached"
+                    )
+                break
+            results.append(result)
+            processed_skills.append(skill)
+            retained_public_records += result_records
+            retained_report_characters += result_characters
+        except Exception:
+            if result is not None and not any(item is result for item in results):
+                try:
+                    cleanup_result(result)
+                except Exception:
+                    logger.warning("Recursive child result cleanup failed")
+            error_message = _RECURSIVE_CHILD_SCAN_FAILED_MESSAGE
             err_console.print(f"         [red]Error:[/red] {error_message}\n")
             execution_failed = True
             failed_skill_count += 1
             results.append({"skill_name": skill.name, "error": error_message})
             processed_skills.append(skill)
 
-    omitted_skill_count = len(skills) - len(processed_skills)
-    if omitted_skill_count:
+    scanned_skill_count = complete_skill_count + partial_skill_count + failed_skill_count
+    unscanned_skill_count = max(
+        0,
+        len(skills) - scanned_skill_count,
+    )
+    output_omitted_skill_count = max(0, scanned_skill_count - len(processed_skills))
+    omitted_symlink_entry_count = detection.omitted_symlink_entries
+    if omitted_symlink_entry_count:
         analysis_incomplete = True
         aggregate_limitations.append(
-            f"{omitted_skill_count} recursive skill(s) omitted after an aggregate limit"
+            f"{omitted_symlink_entry_count} symlinked recursive skill(s) omitted "
+            "(directory symlinks are not followed)"
         )
+        progress_console.print(
+            f"[yellow]Warning:[/yellow] {omitted_symlink_entry_count} symlinked skill "
+            "directories were skipped during recursive discovery and are not "
+            "included in this scan."
+        )
+    skills_omitted_total = unscanned_skill_count + omitted_symlink_entry_count
+    if output_omitted_skill_count:
+        analysis_incomplete = True
+        aggregate_limitations.append(
+            f"{output_omitted_skill_count} scanned recursive skill report(s) omitted "
+            "after an aggregate output limit"
+        )
+    if unscanned_skill_count:
+        analysis_incomplete = True
+        aggregate_limitations.append(
+            f"{unscanned_skill_count} recursive skill(s) unscanned after an aggregate limit"
+        )
+    if _omissions_fail_threshold(skills_omitted_total, min_coverage):
+        coverage_failed = True
     aggregate_limitations = list(dict.fromkeys(aggregate_limitations))[:256]
     aggregate_completeness = _multi_skill_analysis_completeness(
-        total_skills=len(skills),
+        total_skills=len(skills) + omitted_symlink_entry_count,
         complete_skills=complete_skill_count,
         partial_skills=partial_skill_count,
         failed_skills=failed_skill_count,
-        omitted_skills=omitted_skill_count,
+        omitted_skills=skills_omitted_total,
         limitations=aggregate_limitations,
     )
     analysis_incomplete = not bool(aggregate_completeness["is_complete"])
+    aggregate_risk_assessment = _multi_skill_risk_assessment(
+        max_score,
+        execution_failed=execution_failed,
+        analysis_incomplete=analysis_incomplete,
+    )
 
-    status_console.print("\n[bold]═══ Multi-Skill Summary ═══[/bold]\n")
-    status_console.print(
+    progress_console.print("\n[bold]═══ Multi-Skill Summary ═══[/bold]\n")
+    progress_console.print(
         f"  {'Skill':<30} {'Score':<8} {'Severity':<12} {'Findings':<10} {'Execution':<10}"
     )
-    status_console.print(f"  {'─' * 30} {'─' * 8} {'─' * 12} {'─' * 10} {'─' * 10}")
+    progress_console.print(f"  {'─' * 30} {'─' * 8} {'─' * 12} {'─' * 10} {'─' * 10}")
 
     for skill, result in zip(processed_skills, results, strict=True):
         if "error" in result:
-            status_console.print(
+            progress_console.print(
                 f"  {skill.name:<30} {'ERROR':<8} {'—':<12} {'—':<10} {'error':<10}"
             )
             continue
@@ -2553,16 +3159,27 @@ def _scan_multi_skill(
         severity = result.get("risk_severity", "LOW")
         finding_count = len(effective_findings(result))
         execution = "failed" if result.get("execution_successful") is False else "successful"
-        status_console.print(
+        progress_console.print(
             f"  {skill.name:<30} {score:<8} {severity:<12} {finding_count:<10} {execution:<10}"
         )
-    if omitted_skill_count:
-        status_console.print(
-            f"  {'<omitted>':<30} {'—':<8} {'—':<12} {omitted_skill_count:<10} {'partial':<10}"
+    if output_omitted_skill_count:
+        progress_console.print(
+            f"  {'<output omitted>':<30} {'—':<8} {'—':<12} "
+            f"{output_omitted_skill_count:<10} {'partial':<10}"
         )
-        status_console.print(
+    if unscanned_skill_count:
+        progress_console.print(
+            f"  {'<unscanned>':<30} {'—':<8} {'—':<12} {unscanned_skill_count:<10} {'partial':<10}"
+        )
+    if omitted_symlink_entry_count:
+        progress_console.print(
+            f"  {'<symlink omitted>':<30} {'—':<8} {'—':<12} "
+            f"{omitted_symlink_entry_count:<10} {'skipped':<10}"
+        )
+    if output_omitted_skill_count or unscanned_skill_count or omitted_symlink_entry_count:
+        progress_console.print(
             "[yellow]Recursive scan incomplete:[/yellow] one or more skills were omitted "
-            "after an aggregate safety limit."
+            "after an aggregate safety limit or skipped as symlinks."
         )
 
     if format == FormatChoice.json:
@@ -2570,17 +3187,13 @@ def _scan_multi_skill(
             "multi_skill": True,
             "skill_count": len(skills),
             "max_risk_score": max_score,
+            "risk_severity": aggregate_risk_assessment["severity"],
             "execution_successful": not execution_failed,
-            "risk_recommendation": (
-                "DO_NOT_INSTALL"
-                if execution_failed or max_score > RISK_THRESHOLD
-                else "CAUTION"
-                if analysis_incomplete
-                else "SAFE"
-            ),
+            "risk_recommendation": aggregate_risk_assessment["recommendation"],
             "analysis_completeness": aggregate_completeness,
-            "skills_scanned": len(processed_skills),
-            "skills_omitted": omitted_skill_count,
+            "skills_scanned": scanned_skill_count,
+            "skills_omitted": skills_omitted_total,
+            "skills_output_omitted": output_omitted_skill_count,
             "public_finding_records": retained_public_records,
             "report_characters": retained_report_characters,
             "transitive_finding_count": transitive_finding_count,
@@ -2614,12 +3227,28 @@ def _scan_multi_skill(
                 combined_skills.append(entry)
                 entry["transitive_finding_count"] = result.get("transitive_finding_count", 0)
                 entry["transitive_sources"] = result.get("transitive_sources", [])
-        if omitted_skill_count:
+        if output_omitted_skill_count:
             combined_skills.append(
                 {
                     "omitted": True,
-                    "omitted_count": omitted_skill_count,
+                    "omitted_count": output_omitted_skill_count,
+                    "reason": "aggregate_output_limit",
+                }
+            )
+        if unscanned_skill_count:
+            combined_skills.append(
+                {
+                    "omitted": True,
+                    "omitted_count": unscanned_skill_count,
                     "reason": "aggregate_scan_limit",
+                }
+            )
+        if omitted_symlink_entry_count:
+            combined_skills.append(
+                {
+                    "omitted": True,
+                    "omitted_count": omitted_symlink_entry_count,
+                    "reason": "symlink_not_followed",
                 }
             )
         rendered = json.dumps(combined, indent=2)
@@ -2632,39 +3261,41 @@ def _scan_multi_skill(
                 "multi_skill": True,
                 "skill_count": len(skills),
                 "max_risk_score": max_score,
+                "risk_severity": aggregate_risk_assessment["severity"],
                 "execution_successful": not execution_failed,
-                "risk_recommendation": (
-                    "DO_NOT_INSTALL"
-                    if execution_failed or max_score > RISK_THRESHOLD
-                    else "CAUTION"
-                ),
+                "risk_recommendation": _multi_skill_risk_assessment(
+                    max_score,
+                    execution_failed=execution_failed,
+                    analysis_incomplete=True,
+                )["recommendation"],
                 "analysis_completeness": aggregate_completeness,
-                "skills_scanned": len(processed_skills),
-                "skills_omitted": omitted_skill_count,
-                "skills_output_omitted": len(processed_skills),
+                "skills_scanned": scanned_skill_count,
+                "skills_omitted": unscanned_skill_count,
+                "skills_output_omitted": scanned_skill_count,
                 "public_finding_records": 0,
                 "transitive_finding_count": transitive_finding_count,
                 "transitive_sources": [],
                 "skills": [
                     {
                         "omitted": True,
-                        "omitted_count": len(processed_skills),
+                        "omitted_count": scanned_skill_count,
                         "reason": "aggregate_output_limit",
                     }
                 ],
             }
             rendered = json.dumps(combined, indent=2)
         _ensure_recursive_output_bound(rendered)
-        if output:
+        if output is not None:
             Path(output).write_text(rendered, encoding="utf-8")
-            console.print(f"[green]Combined report saved to:[/green] {output}")
+            progress_console.print(f"[green]Combined report saved to:[/green] {output}")
         else:
-            print(rendered)
+            sys.stdout.write(rendered)
     elif format == FormatChoice.sarif:
         merged_sarif = _multi_skill_sarif_report(
             processed_skills,
             results,
             aggregate_completeness,
+            aggregate_risk_assessment,
         )
         rendered = json.dumps(merged_sarif, indent=2)
         if len(rendered) > _MULTI_SKILL_MAX_REPORT_CHARACTERS:
@@ -2672,23 +3303,32 @@ def _scan_multi_skill(
             aggregate_completeness, aggregate_limitations = _mark_recursive_output_limited(
                 aggregate_completeness,
             )
-            merged_sarif = _multi_skill_sarif_report([], [], aggregate_completeness)
+            aggregate_risk_assessment = _multi_skill_risk_assessment(
+                max_score,
+                execution_failed=execution_failed,
+                analysis_incomplete=True,
+            )
+            merged_sarif = _multi_skill_sarif_report(
+                [], [], aggregate_completeness, aggregate_risk_assessment
+            )
             rendered = json.dumps(merged_sarif, indent=2)
         _ensure_recursive_output_bound(rendered)
-        if output:
+        if output is not None:
             Path(output).write_text(rendered, encoding="utf-8")
-            console.print(f"[green]Combined report saved to:[/green] {output}")
+            progress_console.print(f"[green]Combined report saved to:[/green] {output}")
         else:
-            print(rendered)
-    elif output:
+            sys.stdout.write(rendered)
+    else:
         sections: list[str] = []
         for skill, result in zip(processed_skills, results, strict=True):
             if "error" not in result:
                 sections.append(f"--- {skill.relative_path} ---\n\n{_result_body(result)}")
         if analysis_incomplete:
             sections.append(
-                "--- Recursive Inspection Completeness ---\n\n"
-                "Status: partial\n\n" + "\n".join(f"- {item}" for item in aggregate_limitations)
+                _multi_skill_text_summary(
+                    aggregate_completeness,
+                    aggregate_risk_assessment,
+                )
             )
         rendered = "\n\n".join(sections)
         if len(rendered) > _MULTI_SKILL_MAX_REPORT_CHARACTERS:
@@ -2696,13 +3336,23 @@ def _scan_multi_skill(
             aggregate_completeness, aggregate_limitations = _mark_recursive_output_limited(
                 aggregate_completeness,
             )
-            rendered = (
-                "--- Recursive Inspection Completeness ---\n\n"
-                "Status: partial\n\n" + "\n".join(f"- {item}" for item in aggregate_limitations)
+            aggregate_risk_assessment = _multi_skill_risk_assessment(
+                max_score,
+                execution_failed=execution_failed,
+                analysis_incomplete=True,
+            )
+            rendered = _multi_skill_text_summary(
+                aggregate_completeness,
+                aggregate_risk_assessment,
             )
         _ensure_recursive_output_bound(rendered)
-        Path(output).write_text(rendered, encoding="utf-8")
-        console.print(f"[green]Combined report saved to:[/green] {output}")
+        if output is not None:
+            Path(output).write_text(rendered, encoding="utf-8")
+            progress_console.print(f"[green]Combined report saved to:[/green] {output}")
+        elif format is FormatChoice.terminal:
+            console.print(rendered)
+        else:
+            sys.stdout.write(rendered)
 
     for result in results:
         cleanup_result(result)
@@ -2712,6 +3362,8 @@ def _scan_multi_skill(
     if fail_on_incomplete and analysis_incomplete:
         raise typer.Exit(code=1)
     if fail_on_findings and has_findings:
+        raise typer.Exit(code=1)
+    if coverage_failed:
         raise typer.Exit(code=1)
     if max_score > RISK_THRESHOLD:
         raise typer.Exit(code=1)
@@ -2724,13 +3376,15 @@ def mcp(
         typer.Option(
             "--transport",
             "-t",
-            help="Transport: FastMCP stdio for local CLI agents, http for remote/A2A callers.",
+            help="Transport: FastMCP stdio for local CLI agents, http for loopback HTTP clients.",
             case_sensitive=False,
         ),
     ] = TransportChoice.stdio,
     host: Annotated[
         str,
-        typer.Option("--host", help="Host to bind (http transport only)."),
+        typer.Option(
+            "--host", help="Loopback IP to bind (http transport only; localhost is accepted)."
+        ),
     ] = "127.0.0.1",
     port: Annotated[
         int,
@@ -2741,7 +3395,7 @@ def mcp(
     Run SkillSpector as an MCP server.
 
     Exposes a single tool, ``scan_skill``, so any MCP-capable agent (Claude Code,
-    Codex CLI, Gemini CLI) or remote runtime can scan a skill and gate installs
+    Codex CLI, Gemini CLI) can scan a skill locally and gate installs
     on the verdict.
 
     Requires the optional mcp extra. Reinstall the GitHub tool package with
@@ -2756,7 +3410,7 @@ def mcp(
         from skillspector.mcp_server import run as run_mcp
 
         run_mcp(transport=transport.value, host=host, port=port)
-    except ModuleNotFoundError as e:
+    except (ModuleNotFoundError, ValueError) as e:
         err_console.print(f"[red]Error:[/red] {e}")
         raise typer.Exit(code=2) from e
 
@@ -2808,6 +3462,7 @@ def baseline(
         skillspector baseline ./my-skill/ -o team-baseline.yaml --no-llm
         skillspector scan ./my-skill/ --baseline .skillspector-baseline.yaml
     """
+    _exit_on_unsupported_llm_controls(no_llm)
     result = None
     try:
         if verbose:
@@ -2817,7 +3472,26 @@ def baseline(
         state = _scan_state(input_path, FormatChoice.json, no_llm)
         state["baseline_path"] = os.path.abspath(output.expanduser())
         result = graph.invoke(state)
-        findings = effective_findings(result)
+        completeness_value = result.get("analysis_completeness")
+        completeness = completeness_value if isinstance(completeness_value, dict) else {}
+        if (
+            result.get("execution_successful") is False
+            or completeness.get("execution_successful") is False
+            or completeness.get("status") == "failed"
+        ):
+            raise ValueError(
+                "Cannot generate baseline because scan execution failed. "
+                "Run 'skillspector scan' to inspect analysis completeness, "
+                "resolve the failures, and retry."
+            )
+        if completeness.get("is_complete") is False or completeness.get("status") == "partial":
+            err_console.print(
+                "[yellow]Warning:[/yellow] Scan analysis is incomplete; the baseline "
+                "accepts only observed findings and coverage gaps remain."
+            )
+        # Fingerprint every occurrence the next scan checks. The reported
+        # findings are deduplicated and keep only one occurrence's evidence.
+        findings = result["active_findings"]
         data = build_baseline_dict(
             findings,
             reason=reason,

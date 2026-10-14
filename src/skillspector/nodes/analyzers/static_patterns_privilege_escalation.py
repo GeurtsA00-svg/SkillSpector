@@ -17,12 +17,21 @@
 
 from __future__ import annotations
 
+import ast
+import posixpath
 import re
 import sys
 from bisect import bisect_right
+from contextvars import ContextVar
 
 from skillspector.logging_config import get_logger
 from skillspector.models import AnalyzerFinding, Location, Severity
+from skillspector.python_ast import (
+    ParsedPythonFile,
+    parse_python_source,
+    peek_python_ast,
+    peek_python_ast_any_content,
+)
 from skillspector.state import AnalyzerNodeResponse, SkillspectorState
 
 from . import static_runner
@@ -34,21 +43,35 @@ from .common import (
     get_context,
     get_context_from_lines,
     get_line_number,
+    is_reference_material,
+    resolve_call_name,
 )
 from .pattern_defaults import PatternCategory
 
 logger = get_logger(__name__)
 
 ANALYZER_ID = "static_patterns_privilege_escalation"
+USES_PYTHON_SOURCE_TYPE = True
 
-PE1_PATTERNS = [
+# Scan-scoped handle on the runner's shared Python AST cache, published by
+# node() for the analyze() calls the runner makes on its behalf.  This module
+# stays lexical (no USES_PYTHON_AST opt-in) so its windowed and normalized
+# views keep running; the constructed-path analysis below consults the shared
+# cache through this key instead of reparsing.
+_scan_python_ast_cache_key: ContextVar[str | None] = ContextVar(
+    "privilege_escalation_python_ast_cache_key", default=None
+)
+
+PE1_CODE_PATTERNS = [
     (r"permissions?\s*:\s*\[?\s*['\"]?\*['\"]?\s*\]?", 0.8),
-    (r"(?:request|require|need)s?\s+(?:full|all|complete)\s+(?:access|permissions?)", 0.7),
-    (r"(?:grant|give|allow)\s+(?:me\s+)?(?:full|all|complete)\s+(?:access|permissions?)", 0.75),
     (
         r"permissions?\s*:.*?(?:shell_execute|file_write|network).*?(?:shell_execute|file_write|network)",
         0.6,
     ),
+]
+PE1_PROSE_PATTERNS = [
+    (r"(?:request|require|need)s?\s+(?:full|all|complete)\s+(?:access|permissions?)", 0.7),
+    (r"(?:grant|give|allow)\s+(?:me\s+)?(?:full|all|complete)\s+(?:access|permissions?)", 0.75),
     (
         r"(?:also\s+)?(?:need|require)s?\s+(?:write|execute|admin)\s+(?:access|permissions?)\s+(?:for|to)\s+(?:read|view|display)",
         0.7,
@@ -56,17 +79,41 @@ PE1_PATTERNS = [
     (r"(?:escalate|elevate|upgrade)\s+(?:my\s+)?(?:permissions?|privileges?|access)", 0.8),
     (r"(?:bypass|skip|ignore)\s+(?:permission|access)\s+(?:check|validation|restriction)", 0.85),
 ]
-PE2_PATTERNS = [
+PE1_PATTERNS = PE1_CODE_PATTERNS + PE1_PROSE_PATTERNS
+PE2_CODE_PATTERNS = [
     (r"sudo\s+(?!-v|-l|--version|--list)", 0.7),
     (r"sudo\s+-[isSE]", 0.8),
     (r"sudo\s+su\b", 0.9),
-    (r"(?:run|execute)\s+(?:as|with)\s+root", 0.8),
-    (r"(?:requires?|needs?)\s+root\s+(?:access|privileges?|permissions?)", 0.6),
     (r"su\s+-\s*$|su\s+root", 0.8),
     (r"doas\s+", 0.7),
     (r"pkexec\s+", 0.75),
     (r"chmod\s+[ugo]*[+-=]*s", 0.85),
-    (r"chmod\s+[0-7]*[4567][0-7]{2}", 0.8),
+    # A numeric mode only grants setuid/setgid/sticky through its leading octal
+    # digit, so the full four-digit form is what has to be present.  Accepting a
+    # bare 4/5/6/7 anywhere in the mode flagged every ordinary permission whose
+    # rwx triple happened to contain one (chmod 600, chmod 644, chmod 755, ...).
+    # Leading digit 2-7 selects setgid (2, 3, 6) or setuid (4, 5, 7).  A bare 1
+    # only adds sticky, which grants nobody new access, so it stays unreported.
+    # The pieces around the mode: 0* absorbs the leading zeros GNU and BSD chmod
+    # accept, the optional [+=] accepts the operator GNU chmod allows in front of
+    # the digits (chmod +4000, chmod =4755), the option group lets
+    # `chmod -R 4755 dir` reach the mode, the optional quotes cover
+    # `chmod "6755"`, and the trailing lookahead rejects a longer digit run
+    # (chmod 47554) as well as a malformed trailing word (chmod 4755x) while still
+    # matching every non-alphanumeric terminator (space, end of line, `;`, `&`,
+    # `|`, `)`, `$`, a quote or a backtick).
+    # The option group takes a single leading dash on purpose: with `--?` a token
+    # starting `--` can be split between the two alternatives, and on a line of
+    # unmatched `-- ` tokens that made the match exponential.  `[\w=-]*` already
+    # absorbs the second dash of a long option, so `-` alone covers both.
+    (
+        r"chmod\s+(?:-[\w=-]*[ \t]+)*[\"']?[+=]?0*[2-7][0-7]{3}[\"']?(?![0-9\w])",
+        0.8,
+    ),
+]
+PE2_PROSE_PATTERNS = [
+    (r"(?:run|execute)\s+(?:as|with)\s+root", 0.8),
+    (r"(?:requires?|needs?)\s+root\s+(?:access|privileges?|permissions?)", 0.6),
     (r"(?:edit|modify|write|change)\s+(?:/etc/|system)\s+(?:files?|config)", 0.6),
     (
         r"(?:run|execute)\s+(?:this|the)\s+(?:script|command)\s+(?:as|with)\s+(?:sudo|root|admin)",
@@ -74,7 +121,8 @@ PE2_PATTERNS = [
     ),
     (r"(?:you\s+)?(?:will\s+)?need\s+(?:to\s+)?(?:use\s+)?sudo", 0.5),
 ]
-PE3_PATTERNS = [
+PE2_PATTERNS = PE2_CODE_PATTERNS + PE2_PROSE_PATTERNS
+PE3_CODE_PATTERNS = [
     (r"~?/?\.ssh/(?:id_rsa|id_ed25519|id_ecdsa|id_dsa|authorized_keys|known_hosts)", 0.9),
     (r"(?:home|HOME)/\w+/\.ssh/", 0.9),
     (r"Path\s*\.\s*home\s*\(\s*\)\s*/\s*['\"]\.ssh['\"]", 0.9),
@@ -98,10 +146,13 @@ PE3_PATTERNS = [
     (r"(?<!\w)\.env(?:\.local|\.production|\.development)?(?:\s|$|['\"])", 0.6),
     (r"(?:keychain|keyring|gnome-keyring)", 0.7),
     (r"(?:Chrome|Firefox|Safari)/.*?(?:Cookies|Login Data|key4\.db)", 0.8),
+]
+PE3_PROSE_PATTERNS = [
     (r"read\s+(?:the\s+)?(?:ssh|private)\s+key", 0.8),
     (r"access\s+(?:the\s+)?(?:credentials?|secrets?|tokens?)", 0.7),
     (r"(?:extract|copy|get)\s+(?:api\s+)?keys?\s+from", 0.7),
 ]
+PE3_PATTERNS = PE3_CODE_PATTERNS + PE3_PROSE_PATTERNS
 PE4_PATTERNS = [
     (r"/var/run/docker\.sock", 0.9),
     (r"docker\.from_env\(\)", 0.85),
@@ -286,6 +337,50 @@ _PE3_TOKEN_DOCUMENTATION_DIRS = frozenset(
 _MARKDOWN_LINE_PREFIX = re.compile(r"^\s*(?:(?:[-*+>#]|\d+[.)])\s*)*")
 _MAX_CONTEXTUAL_CLASSIFICATION_LINE_CHARS = 4_096
 _MAX_BOUND_TOKEN_CONTEXT_CHARS = 4_096
+# Path-exclusion lists in gitignore syntax: one pattern per line, ``#`` starts
+# a comment, a leading ``!`` re-includes a path, and patterns resolve beneath
+# the directory holding the file.  Each keeps matching files out of a commit,
+# an image build context, a published package, or a tool's or agent's view.
+# ``.gitattributes`` is deliberately absent: its lines attach attributes,
+# including filter, diff and merge drivers, to paths instead of excluding them.
+_PE3_IGNORE_PATTERN_FILE_NAMES = frozenset(
+    {
+        ".aiderignore",
+        ".cursorignore",
+        ".cursorindexingignore",
+        ".dockerignore",
+        ".eslintignore",
+        ".fdignore",
+        ".gcloudignore",
+        ".geminiignore",
+        ".gitignore",
+        ".helmignore",
+        ".ignore",
+        ".npmignore",
+        ".prettierignore",
+        ".rgignore",
+        ".stylelintignore",
+        ".vercelignore",
+    }
+)
+# BuildKit also reads ``<Dockerfile name>.dockerignore`` beside a named Dockerfile.
+# The suffix alone is accepted on purpose, with or without a matching Dockerfile
+# in the bundle: the file name only selects the per-line rules below, and every
+# exemption still needs a line that is one pattern token, not a negation, and
+# not a host path.  Prose or commands in such a file keep their PE3 findings.
+_PE3_IGNORE_PATTERN_FILE_SUFFIX = ".dockerignore"
+# One ignore-file entry: a single pattern token, optionally padded by spaces or
+# tabs.  The token cannot open as a comment (``#``) or a negation (``!``), and
+# cannot contain whitespace, quotes, ``$`` or shell control characters.
+_PE3_IGNORE_FILE_ENTRY = re.compile(
+    r"[ \t]*(?P<pattern>[^\s#!|;&<>()`'\"$][^\s|;&<>()`'\"$]*)[ \t]*"
+)
+# An entry written as a host location instead of a path beneath the ignore
+# file: a home directory (``~``), a drive letter, the system and home roots
+# that PE3's own patterns name, or a parent directory (``..``).
+_PE3_IGNORE_HOST_PATH = re.compile(
+    r"^(?:~|[A-Za-z]:|/(?i:etc|home|users|root)(?:/|$))|(?:^|[/\\])\.\.(?:[/\\]|$)"
+)
 
 
 def _source_line_metadata(content: str) -> tuple[tuple[int, ...], tuple[int, ...]]:
@@ -507,6 +602,60 @@ def _is_bare_credential_store_noun(
     return False
 
 
+def _is_ignore_pattern_file(file_path: str) -> bool:
+    """Return whether *file_path* names a gitignore-syntax path-exclusion list."""
+    basename = file_path.replace("\\", "/").rsplit("/", 1)[-1]
+    return basename in _PE3_IGNORE_PATTERN_FILE_NAMES or basename.endswith(
+        _PE3_IGNORE_PATTERN_FILE_SUFFIX
+    )
+
+
+def _is_ignore_file_exclusion_entry(content: str, match: re.Match[str]) -> bool:
+    """Return True when *match* is the path pattern on its own ignore-file line.
+
+    Callers check the file with :func:`_is_ignore_pattern_file` first. An entry
+    such as ``.env`` or ``config/credentials.json`` keeps that file out of
+    whatever the ignore file governs; it neither reads nor reveals the
+    credential, so it is not credential access.
+
+    The whole physical line (split on ``\\n`` as ignore-file parsers split it,
+    with a trailing ``\\r`` dropped) must be one pattern token containing the
+    match. Every other shape keeps its finding:
+
+    - comments, which are free text an agent may read as instructions;
+    - negated entries such as ``!.env``, which re-include the credential file
+      in the commit, build context, package, or agent view the file governs,
+      so they expose it instead of excluding it;
+    - lines with whitespace, quotes, ``$`` or shell control characters, which
+      are prose or commands rather than one pattern; other logical line
+      separators count as whitespace here;
+    - entries written as host locations (``~``, a drive letter, ``/etc``,
+      ``/home``, ``/Users`` or ``/root``, or a ``..`` segment): ignore files
+      only match beneath their own directory and never expand ``~``, so such
+      an entry excludes no ordinary project file and names a host credential
+      location instead;
+    - lines longer than the contextual-classification bound.
+    """
+    start = match.start()
+    limit = _MAX_CONTEXTUAL_CLASSIFICATION_LINE_CHARS
+    search_from = max(0, start - limit)
+    line_start = content.rfind("\n", search_from, start) + 1
+    if line_start == 0 and search_from > 0:
+        return False
+    line_end = content.find("\n", start, start + limit + 1)
+    if line_end < 0:
+        line_end = len(content)
+    if line_end - line_start > limit:
+        return False
+    if line_end > line_start and content[line_end - 1] == "\r":
+        line_end -= 1
+    entry = _PE3_IGNORE_FILE_ENTRY.fullmatch(content, line_start, line_end)
+    if entry is None or _PE3_IGNORE_HOST_PATH.search(entry.group("pattern")):
+        return False
+    matched_end = start + len(match.group(0).rstrip())
+    return entry.start("pattern") <= start and matched_end <= entry.end("pattern")
+
+
 def _is_access_token_documentation_noun(
     content: str,
     match: re.Match[str],
@@ -650,12 +799,186 @@ def _is_qualified_benign_access_requirement(
     return heading_index >= 0 and lines[heading_index].strip() == "## Access Requirements"
 
 
-def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFinding]:
+# Cheap pre-check before walking for constructed join calls: the AST walk
+# below is only worthwhile when the text plausibly contains a join() call.
+# The gate covers spelling aliases collected from the imports (``from
+# os.path import join as j`` binds ``j`` to ``os.path.join``, so the call
+# site reads ``j(`` with no literal ``join`` in sight).  Keeping the module
+# lexical plus this alias-aware gate preserves the runner's parse-once
+# invariant for files without any join call.
+_JOIN_CALL_BASE_NAMES = {"join"}
+_JOIN_CALL_ALIAS_TARGETS = {"os.path", "os.path.join"}
+
+# Lexical pre-check for a windowed fragment that binds a renamed ``join``
+# without ever spelling ``join(`` (``from os.path import join as j`` calls
+# ``j(``).  On a whole-file cache miss the fragment is parsed to collect its
+# import aliases before the alias-aware join gate below runs, so such
+# fragments must also clear the parse gate; import-only fragments are
+# filtered out again by the alias-aware gate.
+_JOIN_IMPORT_HINT = re.compile(r"^\s*from\s+os\.path\s+import\b", re.MULTILINE)
+
+
+def _join_call_hint(aliases: dict[str, str]) -> re.Pattern[str]:
+    """Return a pre-check pattern matching ``join(`` and imported join aliases.
+
+    Every local name the file binds to ``os.path`` or ``os.path.join`` is a
+    possible call spelling (``j(`` for ``from os.path import join as j``),
+    alongside the plain ``join(`` used by ``os.path.join(``, ``p.join(``,
+    and direct ``join(`` imports.
+    """
+    names = set(_JOIN_CALL_BASE_NAMES)
+    for local, qualified in aliases.items():
+        if qualified in _JOIN_CALL_ALIAS_TARGETS:
+            names.add(local)
+    return re.compile(r"\b(?:" + "|".join(sorted(re.escape(name) for name in names)) + r")\s*\(")
+
+
+def _fragment_whole_file_line_offset(fragment: str, whole_content: str) -> int | None:
+    """Return how many whole-file lines precede a windowed view fragment.
+
+    Windowed view fragments are contiguous slices of the scanned file, so a
+    whole-file AST line number maps onto a fragment-relative line by
+    subtracting this offset.  Return ``None`` when the fragment is not a
+    slice of the whole file (for example a normalized view), so callers keep
+    the standalone-parse fallback.
+    """
+    start = whole_content.find(fragment)
+    if start < 0:
+        return None
+    return whole_content.count("\n", 0, start)
+
+
+def _constructed_sensitive_paths(
+    content: str,
+    file_path: str,
+    python_ast: ParsedPythonFile | None = None,
+) -> list[tuple[int, int, str, float]]:
+    """Return literal sensitive paths assembled with ``os.path.join`` in Python.
+
+    Each hit is a ``(start_line, end_line, path, confidence)`` tuple anchored
+    to the call's source span so callers can deduplicate raw findings across
+    the whole occurrence, including calls wrapped over several lines.
+    Resolved from the Python AST so calls split across lines and supported
+    import spellings (``import os.path as p``, ``from os.path import join``,
+    ``from os.path import join as j``, ``from os import path``) are recognized
+    without reparsing tricks.  The scan's shared parse is reused whenever this
+    runs inside the runner (the cache key published by node()); standalone
+    callers get a single on-demand parse.  Windowed view fragments under a scan
+    miss the whole-file cache entry; behind the same textual join-or-import
+    gate they are evaluated against the whole file's cached tree instead of
+    being parsed standalone, so a fragment starting mid-block (for example
+    inside a function body, which is not a valid module on its own) keeps its
+    findings instead of silently dropping them.  The whole file's import-alias
+    map is carried in from the scan cache for the join gate and call
+    resolution, so a renamed ``os.path.join`` spelling (``from os.path import
+    join as j``) is recognized even when the import lives in an earlier window
+    than the call.  Call spans map onto fragment-relative lines and only
+    calls starting inside the fragment are owned by it, preserving the
+    runner's source-coordinate and dedupe behavior.  When the whole-file tree
+    is unavailable, or the fragment is not a slice of the whole file
+    (normalized views), the fragment is parsed directly as before.  Only
+    fully-literal positional argument lists are resolved; anything dynamic is
+    left to the existing pattern loop.  Unparseable content simply yields no
+    findings here.
+    """
+    whole_file_aliases: dict[str, str] | None = None
+    whole_file_tree: ast.Module | None = None
+    whole_file_source: str | None = None
+    whole_file_line_offset: int | None = None
+    if python_ast is None:
+        cache_key = _scan_python_ast_cache_key.get()
+        if cache_key is not None:
+            python_ast = peek_python_ast(cache_key, content, file_path)
+            if python_ast is None:
+                # A windowed view fragment, not the scan's whole file: the
+                # shared tree does not cover this slice.  Carry the whole
+                # file's import-alias map and tree from the scan cache first
+                # (a fragment is a slice of the same scanned file), so the
+                # textual gate below also fires on renamed call spellings
+                # like ``j(`` when the ``from os.path import join as j``
+                # import lives in an earlier window.  Fragments without a
+                # plausible join call or join import never parse.
+                whole_file = peek_python_ast_any_content(cache_key, file_path)
+                if whole_file is not None and whole_file.tree is not None:
+                    whole_file_aliases = whole_file.import_aliases
+                    whole_file_tree = whole_file.tree
+                    whole_file_source = whole_file.content
+                if _join_call_hint(whole_file_aliases or {}).search(
+                    content
+                ) or _JOIN_IMPORT_HINT.search(content):
+                    if whole_file_tree is not None and whole_file_source is not None:
+                        # Evaluate the whole-file tree rather than parsing the
+                        # fragment standalone: a slice starting mid-block is
+                        # not a valid module, so its standalone parse fails
+                        # and the finding would be silently dropped.
+                        whole_file_line_offset = _fragment_whole_file_line_offset(
+                            content, whole_file_source
+                        )
+                    if whole_file_line_offset is None:
+                        python_ast = parse_python_source(content, file_path)
+        else:
+            python_ast = parse_python_source(content, file_path)
+    if whole_file_tree is not None and whole_file_line_offset is not None:
+        tree = whole_file_tree
+        aliases = whole_file_aliases or {}
+        owned_span: tuple[int, int] | None = (
+            whole_file_line_offset,
+            whole_file_line_offset + len(content.splitlines()),
+        )
+    else:
+        if python_ast is None:
+            return []
+        tree = python_ast.tree
+        if tree is None:
+            return []
+        aliases = (
+            whole_file_aliases if whole_file_aliases is not None else python_ast.import_aliases
+        )
+        owned_span = None
+    if not _join_call_hint(aliases).search(content):
+        return []
+    resolved: list[tuple[int, int, str, float]] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        if resolve_call_name(node, aliases) != "os.path.join":
+            continue
+        if node.keywords or len(node.args) < 2:
+            continue
+        parts = [arg.value for arg in node.args if isinstance(arg, ast.Constant)]
+        if len(parts) != len(node.args) or not all(isinstance(part, str) for part in parts):
+            continue
+        value = posixpath.join(*parts)
+        start_line = node.lineno
+        end_line = node.end_lineno or node.lineno
+        if owned_span is not None:
+            # Only calls starting inside this fragment are owned by it; the
+            # runner's own owned-range filter and cross-window dedupe keep
+            # exactly one finding per call at whole-file coordinates.
+            if not owned_span[0] < start_line <= owned_span[1]:
+                continue
+            start_line -= owned_span[0]
+            end_line -= owned_span[0]
+        for pattern, confidence in PE3_PATTERNS:
+            if re.search(pattern, value, re.IGNORECASE):
+                resolved.append((start_line, end_line, value, confidence))
+                break
+    return resolved
+
+
+def analyze(
+    content: str,
+    file_path: str,
+    file_type: str,
+    python_ast: ParsedPythonFile | None = None,
+) -> list[AnalyzerFinding]:
     """Analyze content for privilege escalation patterns (PE1–PE5)."""
     findings: list[AnalyzerFinding] = []
     line_starts, line_ends = _source_line_metadata(content)
     content_lines = content.splitlines()
     fence_ranges = _markdown_fence_ranges(content) if file_type in {"markdown", "text"} else None
+    reference_material = is_reference_material(file_path, file_type)
+    ignore_pattern_file = _is_ignore_pattern_file(file_path)
 
     def loc(ln: int) -> Location:
         return Location(file=file_path, start_line=ln)
@@ -674,7 +997,12 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
     tag = [PatternCategory.PRIVILEGE_ESCALATION.value]
 
     for pattern, confidence in PE1_PATTERNS:
-        for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
+        matches = (
+            static_runner.iter_paragraph_matches
+            if (pattern, confidence) in PE1_PROSE_PATTERNS
+            else re.finditer
+        )
+        for match in matches(pattern, content, re.IGNORECASE | re.MULTILINE):
             line_num = line_number(match.start())
             context = context_at(match.start())
             findings.append(
@@ -691,7 +1019,12 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                 )
             )
     for pattern, confidence in PE2_PATTERNS:
-        for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
+        matches = (
+            static_runner.iter_paragraph_matches
+            if (pattern, confidence) in PE2_PROSE_PATTERNS
+            else re.finditer
+        )
+        for match in matches(pattern, content, re.IGNORECASE | re.MULTILINE):
             line_num = line_number(match.start())
             context = context_at(match.start())
             finding_tags = list(tag)
@@ -711,10 +1044,17 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                 )
             )
     for pattern, confidence in PE3_PATTERNS:
-        for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
+        matches = (
+            static_runner.iter_paragraph_matches
+            if (pattern, confidence) in PE3_PROSE_PATTERNS
+            else re.finditer
+        )
+        for match in matches(pattern, content, re.IGNORECASE | re.MULTILINE):
             if _is_bare_credential_store_noun(
                 content, match, file_type, fence_ranges, line_starts, line_ends
             ):
+                continue
+            if ignore_pattern_file and _is_ignore_file_exclusion_entry(content, match):
                 continue
             line_num = line_number(match.start())
             context = context_at(match.start())
@@ -784,6 +1124,40 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
                     complete_match=match.group(0),
                 )
             )
+    if file_type == "python":
+        for start_line, end_line, path, confidence in _constructed_sensitive_paths(
+            content, file_path, python_ast
+        ):
+            constructed = AnalyzerFinding(
+                rule_id="PE3",
+                message="Credential Access",
+                severity=Severity.HIGH,
+                location=loc(start_line),
+                confidence=confidence,
+                tags=list(tag),
+                context=get_context(content, line_starts[start_line - 1]),
+                matched_text=path,
+            )
+            # One PE3 per source occurrence: the pattern loop above may already
+            # have fired inside the join call's line span (for example the
+            # literal '.ssh/id_rsa' on a wrapped argument line, while this
+            # finding anchors to the call's first line).  Keep the
+            # best-confidence finding per call span, mirroring the PE4/PE5
+            # per-line aggregation below; unrelated occurrences on other
+            # lines are preserved.
+            duplicate = next(
+                (
+                    existing
+                    for existing in findings
+                    if existing.rule_id == "PE3"
+                    and start_line <= existing.location.start_line <= end_line
+                ),
+                None,
+            )
+            if duplicate is None:
+                findings.append(constructed)
+            elif confidence > duplicate.confidence:
+                findings[findings.index(duplicate)] = constructed
     # Collect best-confidence PE4 finding per line to avoid double-counting lines
     # that match multiple patterns (e.g. DockerClient(base_url=".../docker.sock")).
     pe4_best: dict[int, AnalyzerFinding] = {}
@@ -816,7 +1190,7 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
             line_num = line_number(match.start())
             context = context_at(match.start())
             finding_tags = list(tag)
-            if _is_documentation_example(context, file_type):
+            if reference_material or _is_documentation_example(context, file_type):
                 finding_tags.extend(["contextual-triage", "likely-benign-context"])
             if line_num in pe5_best and pe5_best[line_num].confidence >= confidence:
                 continue
@@ -931,6 +1305,10 @@ def _is_negated_safety_constraint(
 
 def node(state: SkillspectorState) -> AnalyzerNodeResponse:
     """Run privilege_escalation patterns and return findings."""
-    response = static_runner.run_static_patterns_with_ledger(state, [sys.modules[__name__]])
+    token = _scan_python_ast_cache_key.set(state.get("python_ast_cache_key"))
+    try:
+        response = static_runner.run_static_patterns_with_ledger(state, [sys.modules[__name__]])
+    finally:
+        _scan_python_ast_cache_key.reset(token)
     logger.info("%s: %d findings", ANALYZER_ID, len(response["findings"]))
     return response
