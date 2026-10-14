@@ -3184,3 +3184,21 @@ def test_nontrivial_short_paragraphs_remain_bounded(length):
     started = perf_counter()
     assert list(static_runner.iter_paragraph_matches(r"never\s+refuse", content)) == []
     assert perf_counter() - started < 2
+
+
+def test_new_shell_decoder_rules_default_to_interruptible_matching(monkeypatch):
+    from skillspector.nodes.analyzers import static_patterns_supply_chain as module
+
+    pattern = "new-shell-rule"
+    reached = []
+    original = static_runner.iter_pattern_matches
+
+    def capture(candidate, *args, **kwargs):
+        if candidate == pattern:
+            reached.append(candidate)
+        yield from original(candidate, *args, **kwargs)
+
+    monkeypatch.setattr(module, "SC3_SHELL_PATTERNS", [*module.SC3_SHELL_PATTERNS, (pattern, 0.9)])
+    monkeypatch.setattr(static_runner, "iter_pattern_matches", capture)
+    module.analyze("base64 -d new-shell-rule", "install.sh", "shell")
+    assert reached == [pattern]
