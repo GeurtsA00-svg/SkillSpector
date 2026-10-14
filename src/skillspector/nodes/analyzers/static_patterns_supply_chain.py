@@ -2282,8 +2282,13 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
     if has_shell_decoder:
         sc3_patterns = sc3_patterns + SC3_SHELL_PATTERNS
     for pattern, confidence in sc3_patterns:
+        # Shell-decoder rules already bound every stage/literal and use atomic
+        # or possessive ambiguous groups. Keep their audited native matcher;
+        # the interruptible engine adds enough cost to reject dense input.
         matches = (
-            static_runner.iter_paragraph_matches
+            re.finditer
+            if (pattern, confidence) in SC3_SHELL_PATTERNS
+            else static_runner.iter_paragraph_matches
             if (pattern, confidence) in SC3_PROSE_PATTERNS
             else static_runner.iter_pattern_matches
         )

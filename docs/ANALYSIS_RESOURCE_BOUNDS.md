@@ -351,7 +351,9 @@ searches remain outside it. The anti-refusal schema-field helper uses a linear
 whitespace prefix so its benign-context check cannot backtrack quadratically.
 
 Audited command/option patterns use a linear, command-segment search that preserves
-unbounded command spans and the original greedy matches. Memory poisoning's
+unbounded command spans and the original greedy matches. The SC3 shell-decoder
+rules keep their native matcher: their literals, stages and options already have
+explicit length/count bounds and atomic or possessive ambiguous groups. Memory poisoning's
 2–20-character repetition rule uses Python's native engine: failed candidates
 examine at most 20 copies, and successful candidates consume the repeated run.
 The variable shell-flag rule also retains Python’s native backreference semantics.
