@@ -30,6 +30,7 @@ from hashlib import sha256
 from html import escape as escape_html
 from io import StringIO
 from typing import Literal, cast
+from urllib.parse import quote
 
 from rich.console import Console
 from rich.markup import escape
@@ -259,7 +260,7 @@ def _sarif_artifact_location(
         }[key]: value
         for key, value in provenance.items()
     }
-    return SarifArtifactLocation(uri=uri, properties=properties or None)
+    return SarifArtifactLocation(uri=quote(uri, safe="/!"), properties=properties or None)
 
 
 def _occurrence_columns(
@@ -901,7 +902,7 @@ def _build_sarif(
             locations = [
                 SarifLocation(
                     physicalLocation=SarifPhysicalLocation(
-                        artifactLocation=SarifArtifactLocation(uri=path),
+                        artifactLocation=SarifArtifactLocation(uri=quote(path, safe="/!")),
                         region=region,
                     )
                 )
