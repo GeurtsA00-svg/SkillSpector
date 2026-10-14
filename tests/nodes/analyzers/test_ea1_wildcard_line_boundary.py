@@ -28,6 +28,8 @@ survived to the final report.
 
 from __future__ import annotations
 
+import pytest
+
 from skillspector.nodes.analyzers import (
     static_patterns_excessive_agency as ea_module,
 )
@@ -276,3 +278,47 @@ class TestEA1NestedObjectArgumentNotFlagged:
             "json",
         )
         assert not any(f.rule_id == "EA1" for f in findings)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "[\"grep --include='*'\"]",
+        "['grep --include=\"*\"']",
+        "[\"search\", \"grep --include='*'\"]",
+        r'["grep --include=\"*\""]',
+        "['grep --include=''*''']",
+        '["*" + "suffix"]',
+        '["search" "*"]',
+        '["search", "*name"]',
+        '["search", "name*"]',
+        '["search", ["grep", "*"]]',
+        '[{"name": "search", "arguments": {"glob": "*"}}]',
+        '["search", "*\']',
+        '["search", \'*" ]',
+        '["search", "unterminated \'*\']',
+    ],
+)
+def test_only_complete_top_level_wildcard_elements_are_flagged(value: str) -> None:
+    findings = ea_module.analyze(f"tools: {value}\n", "SKILL.md", "markdown")
+    assert not any(f.rule_id == "EA1" for f in findings)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        '["*"]',
+        '["*", "search"]',
+        '["search", "*"]',
+        '[search, "*"]',
+        '["search {x}", "*"]',
+        '["search [x]", "*"]',
+        "[\"grep --include='*'\", \"*\"]",
+        r'["grep --include=\"*\"", "*"]',
+        "['grep --include=''*''', '*']",
+        '["search", "*", "grep"]',
+    ],
+)
+def test_complete_wildcard_elements_after_quoted_scalars_are_flagged(value: str) -> None:
+    findings = ea_module.analyze(f"tools: {value}\n", "SKILL.md", "markdown")
+    assert any(f.rule_id == "EA1" for f in findings)

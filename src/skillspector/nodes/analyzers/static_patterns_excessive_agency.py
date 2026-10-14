@@ -45,22 +45,15 @@ ANALYZER_ID = "static_patterns_excessive_agency"
 
 # EA1: Unrestricted Tool Access
 EA1_CODE_PATTERNS = [
-    # Same-line wildcard grant. The key may be quoted (JSON). A quoted '*' is
-    # unambiguous as a scalar or a top-level list element — the list branch
-    # excludes '{', '}', and '[' so it never descends into a nested object or
-    # array: in tools: [{name: grep, pattern: "*"}] or
-    # tools: ["search", ["grep", "*"]] the '*' is not a top-level tool-list
-    # element and is not a grant. (Ceiling: a quoted element containing one
-    # of those delimiters before a genuine top-level "*" also stops the scan;
-    # walking quoted strings needs a parser, not a pattern.) A bare '*'
-    # counts only when it ends the line (optionally closed by ']' and/or a
-    # '#' comment), so a footnote legend like "Tools: * = requires auth" is
-    # not a grant. The gap around the colon stays on one line so the match
-    # can never bridge paragraphs (#405, #444).
+    # Consume complete scalar elements so quoted tool arguments cannot look
+    # like wildcard grants. Possessive token bodies avoid repartitioning long
+    # near-misses; unquoted nested arrays/objects remain outside this grammar.
     (
         r"['\"]?(?:tools?|permissions?)['\"]?[ \t]*:[ \t]*"
-        r"(?:\[[^\][{}\r\n]*['\"]\*['\"]"
-        r"|\[?[ \t]*['\"]\*['\"]"
+        r"(?:\[(?:[ \t]*+(?:\"(?:[^\"\\\r\n]++|\\[^\r\n])*+\""
+        r"|'(?:[^'\r\n]++|'')*+'|[^\][{},'\"\r\n]++)[ \t]*+,)*"
+        r"[ \t]*(?:\"\*\"|'\*')(?=[ \t]*[,\]])"
+        r"|(?:\"\*\"|'\*')(?=[ \t]*(?:[,}#]|\r?$))"
         r"|\[?[ \t]*\*(?![\*\w])[ \t]*\]?[ \t]*(?:#[^\r\n]*)?\r?$)",
         0.85,
     ),
